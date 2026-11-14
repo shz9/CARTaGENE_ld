@@ -1,0 +1,32 @@
+{
+  "input_prefix": "$HOME/links/projects/def-sgravel/cartagene/flagship_array_imputed_w_cag_and_topmed_r3/PGEN/chr{chrom}.imputed_metaminimac_w_CaG_TOPMed_r3",
+  "metadata": "data/metadata/ancestry_labels.tsv",
+  "panel": "data/reference/panel.grch38.tsv",
+  "genetic_map": "data/genetic_map/chr_{chrom}.tsv",
+  "ancestries": [
+    "AFR",
+    "AMR",
+    "CSA",
+    "EAS",
+    "EUR",
+    "MID"
+  ],
+  "sample_keep": null,
+  "scratch_dir": null,
+  "output_dir": "results",
+  "maf": 0.001,
+  "mac": 20,
+  "geno": 0.02,
+  "mind": 0.02,
+  "hwe": 1e-06,
+  "hard_call_threshold": 0.1,
+  "info_field": null,
+  "min_info": 0.8,
+  "min_samples": 100,
+  "estimator": "windowed",
+  "window_cm": 3,
+  "blocks": null,
+  "storage_dtype": "int16",
+  "retain_bed": false,
+  "run_tag": "v1"
+}
