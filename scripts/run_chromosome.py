@@ -102,6 +102,7 @@ def samples(metadata, available, groups, keep=None):
     table = pd.read_csv(metadata, sep='\t', dtype=str, keep_default_na=False)
     if not {'FID', 'IID', 'Ancestry'} <= set(table.columns):
         raise ValueError('Metadata requires FID, IID, Ancestry headers')
+    table = table.loc[table.Ancestry.ne('OTH')]
     if not table[['FID', 'IID']].apply(lambda col: col.str.fullmatch(r'\S+')).all().all():
         raise ValueError('Invalid sample ID')
     if table.IID.duplicated().any():

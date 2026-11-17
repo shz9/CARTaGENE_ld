@@ -67,8 +67,8 @@ class PipelineTests(unittest.TestCase):
             match_pvar(pvar, {(10, 'A', 'G'): 'rs1'}, 1, 'R2')
 
     def test_samples_preserve_strings_and_intersect_pairs(self):
-        psam = self.write('a.psam', '#FID IID SEX\n001 001 2\n002 002 1\n')
-        meta = self.write('labels.tsv', 'FID\tIID\tAncestry\n001\t001\tEUR\n002\t002\tAFR\n003\t003\tEUR\n')
+        psam = self.write('a.psam', '#FID IID SEX\n001 001 2\n002 002 1\n004 004 2\n')
+        meta = self.write('labels.tsv', 'FID\tIID\tAncestry\n001\t001\tEUR\n002\t002\tAFR\n003\t003\tEUR\n004\t004\tOTH\n005\t005\tOTH\n')
         groups, missing = samples(meta, sample_ids(psam), ['EUR', 'AFR'], {('001', '001')})
         self.assertEqual(groups, {'EUR': [('001', '001')], 'AFR': []})
         self.assertEqual(missing, 1)

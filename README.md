@@ -138,7 +138,8 @@ FID	IID	AFR	AMR	CSA	EAS	EUR	MID	Ancestry
 ```
 
 The assigned `Ancestry` column is authoritative; proportions are not reclassified.
-Unknown labels and duplicate IDs fail validation. Missing chromosome samples are
+`OTH` samples (unknown ancestry) are excluded before sample selection. Other
+unexpected labels and duplicate IDs fail validation. Missing chromosome samples are
 reported; absent groups are skipped. Groups below 100 post-QC samples are skipped;
 groups below 1,000 merit particular caution. For unrelated LD references, supply a
 headered `FID IID` keep file through `sample_keep` in the config.
