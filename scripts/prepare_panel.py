@@ -2,12 +2,13 @@
 """Stream GRCh38 dbSNP once, retaining unambiguous requested biallelic SNPs."""
 import argparse
 from collections import Counter
-import csv
 import gzip
 import hashlib
 import json
 from pathlib import Path
 import re
+
+import pandas as pd
 
 COLUMNS = ['CHROM', 'POS', 'REF', 'ALT', 'RSID']
 RSID = re.compile(r'rs[0-9]+')
@@ -21,11 +22,8 @@ def chromosome(value):
 
 
 def sha256(path):
-    digest = hashlib.sha256()
     with Path(path).open('rb') as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b''):
-            digest.update(block)
-    return digest.hexdigest()
+        return hashlib.file_digest(handle, 'sha256').hexdigest()
 
 
 def identity(path):
@@ -72,15 +70,9 @@ def resolve_panel(vcf, wanted):
     return sorted(result), dict(counts)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--assembly', choices=['GRCh38'], required=True)
-    parser.add_argument('--dbsnp-vcf', type=Path, required=True)
-    parser.add_argument('--rsids', type=Path, nargs='+', required=True)
-    parser.add_argument('--output', type=Path, default=Path('data/reference/panel.grch38.tsv'))
-    args = parser.parse_args()
+def read_rsids(paths):
     wanted = set()
-    for path in args.rsids:
+    for path in paths:
         for line in path.read_text().splitlines():
             value = line.strip()
             if not value or value.startswith('#'):
@@ -90,16 +82,24 @@ def main():
             wanted.add(value)
     if not wanted:
         raise ValueError('Empty panel')
+    return wanted
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--assembly', choices=['GRCh38'], required=True)
+    parser.add_argument('--dbsnp-vcf', type=Path, required=True)
+    parser.add_argument('--rsids', type=Path, nargs='+', required=True)
+    parser.add_argument('--output', type=Path, default=Path('data/reference/panel.grch38.tsv'))
+    args = parser.parse_args()
+    wanted = read_rsids(args.rsids)
     rows, summary = resolve_panel(args.dbsnp_vcf, wanted)
     if not rows:
         raise ValueError('No usable panel variants resolved')
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix('.tmp')
-    with temporary.open('w') as handle:
-        writer = csv.writer(handle, delimiter='\t', lineterminator='\n')
-        writer.writerow(COLUMNS)
-        for key, rsid in rows:
-            writer.writerow([*key, rsid])
+    pd.DataFrame.from_records([(*key, rsid) for key, rsid in rows], columns=COLUMNS).to_csv(
+        temporary, sep='\t', index=False)
     temporary.replace(args.output)
     summary.update(assembly=args.assembly, dbsnp=identity(args.dbsnp_vcf),
                    lists=[dict(identity(p), sha256=sha256(p)) for p in args.rsids],

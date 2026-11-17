@@ -7,6 +7,8 @@
 #SBATCH --output=logs/ld-%A_%a.out
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:?Submit from the repository root}"
+# Use the same Python module for venv creation and execution.
+module load "${PYTHON_MODULE:-python/3.13}"
 module load plink
 plink_bin=$(command -v plink2 || command -v plink)
 "$plink_bin" --version

@@ -2,12 +2,15 @@
 """Download and normalize the Beagle GRCh38 genetic map."""
 
 import argparse
-import io
 import json
-import math
+import os
 import pathlib
 import urllib.request
 import zipfile
+
+import pandas as pd
+
+from annotate_bim import validate_genetic_map
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -52,115 +55,30 @@ def find_members(names):
     return members
 
 
+def statistics(table):
+    return {'markers': len(table), 'first': table.head(1).to_dict('records')[0], 'last': table.tail(1).to_dict('records')[0]}
+
+
 def normalize_map(source, destination, chrom):
-    previous_position = None
-    previous_cm = None
-    rows = 0
-    temporary = destination.with_name(destination.name + ".tmp")
-
-    first = None
-    last = None
-
-    try:
-        # TextIOWrapper owns and closes the ZipExtFile. Reading it to EOF also
-        # makes zipfile verify the member CRC without a separate archive pass.
-        with io.TextIOWrapper(source) as text, temporary.open("w") as output:
-            output.write("position\tcm\n")
-
-            for line_number, line in enumerate(text, start=1):
-                fields = line.split()
-                if not fields:
-                    continue
-                if len(fields) != 4:
-                    raise RuntimeError(
-                        f"Malformed map row {line_number} for chromosome {chrom}"
-                    )
-                if fields[0] != str(chrom):
-                    raise RuntimeError(
-                        f"Unexpected chromosome {fields[0]} "
-                        f"in chromosome {chrom} map"
-                    )
-
-                try:
-                    cm = float(fields[2])
-                    position = int(fields[3])
-                except ValueError as exc:
-                    raise RuntimeError(
-                        f"Invalid map row {line_number} for chromosome {chrom}"
-                    ) from exc
-
-                if not math.isfinite(cm) or position < 1:
-                    raise RuntimeError(
-                        f"Invalid map values at row {line_number}: "
-                        f"{position}, {cm}"
-                    )
-                if previous_position is not None and position <= previous_position:
-                    raise RuntimeError(
-                        "Map positions are not strictly increasing for "
-                        f"chromosome {chrom}"
-                    )
-                if previous_cm is not None and cm < previous_cm:
-                    raise RuntimeError(
-                        f"Map cM values decrease for chromosome {chrom}"
-                    )
-
-                row = {"position": position, "cm": cm}
-                if first is None:
-                    first = row
-                last = row
-                output.write(f"{position}\t{fields[2]}\n")
-                previous_position = position
-                previous_cm = cm
-                rows += 1
-
-        if rows < 2:
-            raise RuntimeError(f"Too few map rows for chromosome {chrom}: {rows}")
-
-        temporary.replace(destination)
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        raise
-
-    return {"markers": rows, "first": first, "last": last}
+    with source:
+        table = pd.read_csv(source, sep=r'\s+', header=None)
+    table.columns = ['chrom', 'id', 'cm', 'position']
+    if not table.chrom.eq(chrom).all():
+        raise RuntimeError(f'Unexpected chromosome in chromosome {chrom} map')
+    table = validate_genetic_map(table[['position', 'cm']])
+    temporary = destination.with_name(destination.name + '.tmp')
+    table.to_csv(temporary, sep='\t', index=False)
+    temporary.replace(destination)
+    return statistics(table)
 
 
-def map_statistics(path):
-    first = None
-    last = None
-    count = 0
-    previous_position = None
-    previous_cm = None
-    with path.open() as handle:
-        if next(handle, "").split() != ["position", "cm"]:
-            raise RuntimeError(f"Unexpected genetic-map header in {path}")
-        for line_number, line in enumerate(handle, start=2):
-            fields = line.split()
-            if len(fields) != 2:
-                raise RuntimeError(f"Malformed row {line_number} in {path}")
-            row = {"position": int(fields[0]), "cm": float(fields[1])}
-            if row["position"] < 1 or not math.isfinite(row["cm"]):
-                raise RuntimeError(
-                    f"Invalid map values at row {line_number} in {path}"
-                )
-            if (
-                previous_position is not None
-                and row["position"] <= previous_position
-            ):
-                raise RuntimeError(f"Positions are not increasing in {path}")
-            if previous_cm is not None and row["cm"] < previous_cm:
-                raise RuntimeError(f"cM values decrease in {path}")
-            if first is None:
-                first = row
-            last = row
-            previous_position = row["position"]
-            previous_cm = row["cm"]
-            count += 1
-    if count < 2:
-        raise RuntimeError(f"Too few map rows in {path}: {count}")
-    return {"markers": count, "first": first, "last": last}
+def map_statistics(filename):
+    return statistics(validate_genetic_map(pd.read_csv(filename, sep='\t')))
 
 
 def main():
+    if os.environ.get("SLURM_JOB_ID"):
+        raise SystemExit("Prepare genetic maps directly on the login node, outside a SLURM job.")
     parser = argparse.ArgumentParser(
         description="Prepare the Beagle/HapMap GRCh38 genetic map"
     )

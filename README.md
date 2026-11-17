@@ -6,6 +6,63 @@ stay on the SLURM cluster. Autosomes 1–22 are supported. The implementation fo
 [HGDP+1KG](https://github.com/shz9/1KG_HGDP_ld), with early panel extraction to
 handle CARTaGENE's approximately 455 million input variants and 30,000 participants.
 
+## Run from one entry point
+
+On the **login node**, supply the ancestry metadata and rsID lists, then run:
+
+```bash
+# Pilot: prepare/check dependencies and inputs, then submit chromosome 22.
+bash scripts/run_pipeline.sh --chromosomes 22 \
+  --rsids data/panels/hm3.rsids data/panels/prs.rsids
+
+# Once the prepared panel is available, the source lists/VCF are optional.
+bash scripts/run_pipeline.sh --chromosomes 1-22 --max-concurrent 4
+
+# Validate existing dependencies and inputs without downloading or submitting.
+bash scripts/run_pipeline.sh --chromosomes 22 --check-only
+
+# Prepare and validate everything, stopping before submission.
+bash scripts/run_pipeline.sh --chromosomes 22 --prepare-only \
+  --rsids data/panels/hm3.rsids data/panels/prs.rsids
+```
+
+This entry point loads the Python/PLINK modules, creates or repairs the Python
+environment when needed, checks installed dependencies and the compiled native
+LD backend, validates metadata and **all requested genotype triplets**, prepares
+missing references, validates them, and submits a SLURM array only after every
+check succeeds. A failure prevents submission of the entire requested array.
+`--check-only` still writes a validation report to `logs/preflight.json` and checks
+that output/log/scratch directories are writable; it installs/downloads nothing.
+An explicitly configured scratch directory is checked on the login node;
+otherwise jobs rely on the scheduler-provided `SLURM_TMPDIR`.
+
+Use `--config FILE` for alternate settings, `--chromosomes 1-3,22` to select
+chromosomes, and `--max-concurrent N` to limit simultaneous jobs. Normal successful
+runs **submit jobs automatically**. `logs/preflight.json` records validation details
+and the submitted job ID. Jobs receive a snapshot of the validated configuration.
+`submit.sh` remains an alias for this workflow; direct `sbatch` is an advanced
+path that bypasses the login-node checks.
+
+When the panel needs building, `--rsids` is required. The default dbSNP location is
+`data/reference/GCF_000001405.40.gz`. If absent, the script downloads it on the
+login node with resume support and verifies the source's accompanying MD5 before
+use. Set `--dbsnp-vcf /path/to/existing/GRCh38.vcf.gz` to reuse a verified local copy,
+or `--dbsnp-url URL` to choose a GRCh38 release (with an accompanying `URL.md5`).
+Existing local VCFs are assumed to have been verified by you. A supplied panel is
+validated without requiring the full VCF; when source lists are supplied, their
+hashes, the panel receipt, and available VCF metadata determine whether to rebuild.
+
+Genotype checks inspect readability, PGEN magic bytes, PVAR headers/first records,
+PSAM IDs, and ancestry intersections. They do **not** scan the full PGEN/PVAR or
+prove all files' sample/variant counts match. PLINK and the chromosome processing
+stage perform the full checks on compute nodes. A header-only preflight keeps the
+login-node work bounded for the 455-million-variant source dataset.
+
+The individual setup/preparation commands below remain available for debugging
+and manual control. The unified entry point honors configured panel, map and block
+paths; block files are prepared from the configured ancestry mapping and checked
+against their provenance manifest before submission.
+
 ## Design and filtering plan
 
 1. Supply a union of HapMap3 and your chosen PRS panels as one or more rsID lists.
@@ -46,11 +103,11 @@ handle CARTaGENE's approximately 455 million input variants and 30,000 participa
 8. Interpolate cM from the Beagle-distributed HapMap **GRCh38** map into BIM column
    3; use the nearest endpoint beyond map coverage and report those counts.
 9. Compute ancestries sequentially in one job per chromosome, using magenpy's
-   native BED backend (no PLINK1 required). Default: 3 cM window, int16, Zstandard,
-   consolidated Zarr v2 ZIP. The common map is a distance approximation for all
-   groups. Optional GRCh38 ancestry-specific blocks can replace windows; supply
-   validated files for every requested ancestry. Window truncation and quantization
-   may affect numerical properties; downstream methods may need regularization.
+   native BED backend (no PLINK1 required). Default: **block-diagonal LD, int8**,
+   Zstandard, consolidated Zarr v2 ZIP. GRCh38 pyrho blocks are matched to each
+   ancestry using the HGDP+1KG mappings below. Block truncation and int8
+   quantization may affect numerical properties; downstream methods may need
+   regularization. The interpolated common cM map remains in BIM metadata.
 
 [PLINK2 filtering](https://www.cog-genomics.org/plink/2.0/filter),
 [dosage hardcalls](https://www.cog-genomics.org/plink/2.0/input#dosage_import), and
@@ -81,59 +138,118 @@ reported; absent groups are skipped. Groups below 100 post-QC samples are skippe
 groups below 1,000 merit particular caution. For unrelated LD references, supply a
 headered `FID IID` keep file through `sample_keep` in the config.
 
-Create a persistent environment once on a node with internet access (Python 3.11–3.13;
-load your cluster's Python/compiler modules first if needed):
+Create a persistent environment once **on the login node**:
 
 ```bash
 bash scripts/setup_env.sh
 ```
+
+Environment setup, reference preparation, and chromosome jobs each load
+`python/3.13` before invoking Python. Setup uses that module's `python3` to create
+`env/ld`; subsequent steps use `env/ld/bin/python` with the same module loaded.
+To use another supported module (Python 3.11–3.13), export `PYTHON_MODULE` before
+setup, preparation, and submission, for example `export PYTHON_MODULE=python/3.12`.
+Recreate the environment when changing Python versions. Load any additional
+compiler modules required by your cluster before setup.
 
 This installs pinned magenpy 0.2.5 and Zarr v2 in `env/ld`. Jobs use `module load
 plink` and resolve `plink2` or `plink` from that module, verifying it is PLINK v2.
 No PLINK download is performed. This venv route avoids assuming an available Docker
 image/tag or compute-node network access. It must be compatible with compute nodes.
 
-## Prepare public references once
+## Prepare public references on the login node
+
+**Compute nodes have no internet access.** Run environment setup, all downloads,
+and reference preparation directly on the login node before submitting LD jobs.
+Do not use `sbatch` for these steps. The preparation entry points reject invocation
+inside a SLURM job. There is no download fallback in the chromosome jobs: missing
+local references cause an early failure with preparation instructions.
 
 Put your panel lists at e.g. `data/panels/hm3.rsids` and `data/panels/prs.rsids`,
 one rsID per line, no header (blank lines and # comments allowed). Obtain a GRCh38
-dbSNP VCF from [NCBI](https://ftp.ncbi.nlm.nih.gov/snp/latest_release/VCF/), record its
-release/checksum, and download it on a transfer node. This is a large download;
-reuse the verified HGDP+1KG copy if available. The reference job streams it once:
+dbSNP VCF from [NCBI](https://ftp.ncbi.nlm.nih.gov/snp/latest_release/VCF/) on the
+login node, record its release/checksum, and verify the assembly. This is a large
+download; reuse the verified HGDP+1KG copy if available. For example, on the login node:
 
 ```bash
-mkdir -p logs
-sbatch scripts/prepare_references.sbatch /absolute/path/to/GRCh38.dbsnp.vcf.gz \
+mkdir -p data/reference
+curl --fail --location --continue-at - \
+  --output data/reference/GCF_000001405.40.gz \
+  https://ftp.ncbi.nlm.nih.gov/snp/latest_release/VCF/GCF_000001405.40.gz
+# Verify the downloaded release against NCBI's accompanying checksum before use.
+bash scripts/prepare_references.sh data/reference/GCF_000001405.40.gz \
   data/panels/hm3.rsids data/panels/prs.rsids
 ```
 
-The job builds `data/reference/panel.grch38.tsv` and its JSON report, and downloads
-and normalizes the Beagle GRCh38 map. It requires internet only if the map ZIP is
-not already cached; to work offline pre-stage `data/genetic_map/plink.GRCh38.map.zip`.
-It records input file sizes/mtimes and list hashes; archive source metadata is in
-`data/genetic_map/summary.json`. Verify the dbSNP assembly independently; filenames
-alone do not establish build. `--assembly GRCh38` is a required assertion.
+The login-node script downloads and normalizes the Beagle GRCh38 genetic map and
+ancestry-matched LD blocks, then streams the local dbSNP VCF to build
+`data/reference/panel.grch38.tsv`. The full dbSNP scan may take hours; allocate
+sufficient login-node resources according to cluster policy. This replaces the
+former `prepare_references.sbatch` workflow. All reference outputs and `env/ld`
+must be on storage visible to compute nodes.
+
+LD blocks come from [LDblocks_GRCh38](https://github.com/jmacdon/LDblocks_GRCh38),
+using **pyrho** boundaries. The `block_ancestry_map` object in
+`config/pipeline.json` defines the source ancestry for every CARTaGENE ancestry;
+the defaults match HGDP+1KG:
+
+| CARTaGENE ancestry | Source block ancestry | Local normalized file |
+|---|---|---|
+| AFR | AFR | `data/blocks/AFR.bed` |
+| AMR | AFR (proxy) | `data/blocks/AMR.bed` |
+| CSA | SAS (proxy) | `data/blocks/CSA.bed` |
+| EAS | EAS | `data/blocks/EAS.bed` |
+| EUR | EUR | `data/blocks/EUR.bed` |
+| MID | EUR (proxy) | `data/blocks/MID.bed` |
+
+`prepare_blocks.py` reads these mappings from `pipeline.json`; they are not
+hardcoded in Python. Edit the mapping and rerun login-node reference preparation
+to regenerate affected files. Outputs retain the CARTaGENE ancestry names, so
+`blocks: "data/blocks/{ancestry}.bed"` continues to work for chromosome jobs.
+For a different configuration, use `prepare_blocks.py --config /path/to/pipeline.json`
+or `bash scripts/prepare_references.sh --config /path/to/pipeline.json VCF panel...`.
+The preparation wrapper's other reference destinations remain the standard paths.
+
+The proxies preserve the previous pipeline's choices; they are not independently
+estimated CARTaGENE or admixed-population boundaries. Source coordinates are
+preserved and passed to magenpy as `[start, stop)` intervals. SNPs in gaps or
+outside the blocks are excluded from LD; QC and LD SNP counts are reported
+separately. Cross-block correlations are set to zero.
+
+Block preparation validates non-overlapping intervals and coverage of all 22
+autosomes. `data/blocks/summary.json` records each ancestry's source, URL, counts,
+and output SHA256. Cached blocks are reused only when their manifest matches.
+Download/validation errors stop preparation rather than silently dropping groups.
+The map archive and normalized maps are cached in `data/genetic_map/`, with source
+metadata in `summary.json`. Panel preparation records dbSNP file size/mtime and
+panel-list hashes; `--assembly GRCh38` is a required assertion. To refresh blocks,
+run `env/ld/bin/python scripts/prepare_blocks.py --force` on the login node.
+
+To opt into windowed LD, set `estimator` to `windowed` and `window_cm` to `3` in
+the configuration. The common cM map is an approximation for all groups.
+`storage_dtype` can independently be changed to `int16` or floating point.
 
 ## Pilot and production
 
 Edit `config/pipeline.json` for paths, groups, QC and output settings. Relative
 paths resolve from the repository root; environment variables and `~` expand.
-The configuration is read at job start; keep it fixed while an array runs.
+The unified entry point snapshots the validated configuration for submitted jobs.
+Keep reference and genotype files fixed while an array runs.
 
 ```bash
-bash scripts/submit.sh config/pipeline.json 22
+bash scripts/run_pipeline.sh --config config/pipeline.json --chromosomes 22
 # Inspect counts, PLINK logs, map endpoint counts and LD before scaling:
-bash scripts/submit.sh config/pipeline.json 1-22%4
+bash scripts/run_pipeline.sh --config config/pipeline.json --chromosomes 1-22 --max-concurrent 4
 ```
 
 Default allocation per chromosome: 16 CPUs, 128 GiB RAM, 48 hours; at most four
 chromosomes concurrently in the example. These are initial requests, not measured
 requirements. chr1 is a second useful resource pilot. Use `sacct` to inspect peak
 RSS and runtime and adjust `--mem`/`--time` via `SBATCH_MEM`/`SBATCH_TIMELIMIT` or
-edit the batch directives. Large windows/high-density regions can dominate storage
+edit the batch directives. Large blocks/high-density regions can dominate storage
 and compute. Shared full-panel BED is about N*M/4 bytes (roughly 19 GB genome-wide
 at 30k x 2.5M), excluding per-ancestry copies, LD and temporaries. Provision generous
-scratch; LD size depends on local density and map plateaus. Jobs require
+scratch; LD size depends on local density and block size (or map plateaus in window mode). Jobs require
 `SLURM_TMPDIR` or a configured `scratch_dir` on a suitable filesystem.
 
 ## Outputs and reruns
@@ -154,7 +270,7 @@ results/<chromosome-fingerprint>/chr22/
 ```
 
 The exact output path is printed in the job log. Summary reports panel matches,
-unmatched metadata, pre/post-QC sample/variant counts, skipped groups, endpoint cM
+unmatched metadata, pre/post-QC sample/variant counts, LD variant counts, skipped groups, endpoint cM
 counts, parameters and software versions. `variants.tsv` records original ID,
 rsID, GRCh38 REF/ALT and position. Keep BIM/FAM and logs private: they contain sample
 IDs. Data, environments, logs and results are gitignored. No upload or publication
@@ -173,13 +289,16 @@ a killed job may leave a lock requiring manual removal after confirming it is de
 ## Local verification
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+PYTHONDONTWRITEBYTECODE=1 env/ld/bin/python -m unittest discover -s tests -v
 for script in scripts/*.sh scripts/*.sbatch; do bash -n "$script"; done
 ```
 
-Tests cover allele-aware mapping, ambiguous sites, sample intersections and cM
+Pandas and NumPy (installed with magenpy) handle metadata tables and interpolation;
+full dbSNP and PVAR files remain streamed to bound memory. Tests cover
+allele-aware mapping, ambiguous sites, sample intersections and cM
 annotation with synthetic data. When magenpy is installed, an additional numerical
-test checks signed correlations against NumPy and reopens the saved ZIP; otherwise
+test checks windowed and ancestry-specific block correlations against NumPy,
+including int8 storage, cross-block zeros and reopening saved ZIPs; otherwise
 that test is skipped. Run the full set with `env/ld/bin/python -m unittest discover
 -s tests -v`. To inspect a saved matrix with magenpy:
 

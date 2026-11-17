@@ -1,157 +1,84 @@
 #!/usr/bin/env python3
-"""Atomically add interpolated cM positions and rsIDs to a PLINK BIM."""
-
+"""Annotate filtered BIM tables with rsIDs and interpolated GRCh38 cM."""
 import argparse
-import math
-import pathlib
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+BIM_COLUMNS = ['CHR', 'SNP', 'CM', 'POS', 'A1', 'A2']
 
 
-def load_genetic_map(path):
-    positions = []
-    cms = []
-
-    with path.open() as handle:
-        header = next(handle, "").split()
-        if header != ["position", "cm"]:
-            raise RuntimeError(f"Unexpected genetic-map header in {path}")
-
-        for line_number, line in enumerate(handle, start=2):
-            fields = line.split()
-            if len(fields) != 2:
-                raise RuntimeError(f"Malformed genetic-map row {line_number}")
-            position = int(fields[0])
-            cm = float(fields[1])
-            if position < 1:
-                raise RuntimeError(
-                    f"Invalid genetic-map position at row {line_number}"
-                )
-            if positions and position <= positions[-1]:
-                raise RuntimeError("Genetic-map positions are not increasing")
-            if cms and cm < cms[-1]:
-                raise RuntimeError("Genetic-map cM values are decreasing")
-            if not math.isfinite(cm):
-                raise RuntimeError(f"Non-finite cM value at row {line_number}")
-            positions.append(position)
-            cms.append(cm)
-
-    if len(positions) < 2:
-        raise RuntimeError(f"Too few genetic-map rows in {path}")
-    return positions, cms
+def read_bim(filename):
+    table = pd.read_csv(filename, sep=r'\s+', header=None, keep_default_na=False,
+                        dtype={0: str, 1: str, 3: 'int64', 4: str, 5: str})
+    table.columns = BIM_COLUMNS
+    return table
 
 
-def load_rsids(path):
-    mapping = {}
-    with path.open() as handle:
-        for line_number, line in enumerate(handle, start=1):
-            fields = line.split()
-            if len(fields) != 2:
-                raise RuntimeError(f"Malformed rsID-map row {line_number}")
-            old_id, new_id = fields
-            if old_id in mapping:
-                raise RuntimeError(f"Duplicate source variant ID: {old_id}")
-            mapping[old_id] = new_id
-    return mapping
+def validate_genetic_map(table):
+    if list(table.columns) != ['position', 'cm'] or len(table) < 2:
+        raise RuntimeError('Genetic map requires position/cm columns and at least two markers')
+    if not np.isfinite(table.to_numpy()).all() or table.position.le(0).any():
+        raise RuntimeError('Invalid genetic-map values')
+    if (table.position % 1 != 0).any() or table.position.diff().le(0).any():
+        raise RuntimeError('Genetic-map positions must be integers and strictly increasing')
+    if table.cm.diff().lt(0).any():
+        raise RuntimeError('Genetic-map cM values are decreasing')
+    return table
 
 
-def interpolate_sorted(position, positions, cms, index):
-    """Interpolate one nondecreasing position with a reusable map cursor."""
-    while index < len(positions) and positions[index] < position:
-        index += 1
-
-    if index < len(positions) and positions[index] == position:
-        return cms[index], "exact", index
-    if index == 0:
-        return cms[0], "below", index
-    if index == len(positions):
-        return cms[-1], "above", index
-
-    left_position = positions[index - 1]
-    fraction = (
-        (position - left_position)
-        / (positions[index] - left_position)
-    )
-    value = cms[index - 1] + fraction * (cms[index] - cms[index - 1])
-    return value, "interpolated", index
+def load_genetic_map(filename):
+    table = validate_genetic_map(pd.read_csv(filename, sep=r'\s+'))
+    return table.position.to_numpy(), table.cm.to_numpy()
 
 
-def format_cm(value):
-    return f"{value:.10f}".rstrip("0").rstrip(".") or "0"
+def variant_table(mapping):
+    return pd.DataFrame.from_records(
+        [(old, rsid, *key) for old, (key, rsid) in mapping.items()],
+        columns=['ORIGINAL_ID', 'RSID', 'POS', 'REF', 'ALT']).set_index('ORIGINAL_ID')
 
 
-def annotate(bim_path, map_path, rsid_path):
-    positions, cms = load_genetic_map(map_path)
-    rsids = load_rsids(rsid_path)
-    temporary = bim_path.with_name(bim_path.name + ".tmp")
-    counts = {
-        "variants": 0,
-        "renamed": 0,
-        "exact": 0,
-        "interpolated": 0,
-        "below": 0,
-        "above": 0,
-    }
-    previous_position = None
-    map_index = 0
-
-    try:
-        with bim_path.open() as source, temporary.open("w") as output:
-            for line_number, line in enumerate(source, start=1):
-                fields = line.split()
-                if len(fields) < 6:
-                    raise RuntimeError(f"Malformed BIM row {line_number}")
-
-                position = int(fields[3])
-                if previous_position is not None and position < previous_position:
-                    raise RuntimeError("BIM positions are not increasing")
-                previous_position = position
-
-                cm, interpolation, map_index = interpolate_sorted(
-                    position, positions, cms, map_index
-                )
-                fields[2] = format_cm(cm)
-                counts[interpolation] += 1
-
-                new_id = rsids.get(fields[1])
-                if new_id is not None:
-                    fields[1] = new_id
-                    counts["renamed"] += 1
-
-                output.write("\t".join(fields) + "\n")
-                counts["variants"] += 1
-
-        if counts["renamed"] != len(rsids):
-            raise RuntimeError(
-                f"Applied {counts['renamed']} of {len(rsids)} rsID mappings"
-            )
-
-        temporary.replace(bim_path)
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        raise
-
-    return counts
+def annotate(bim, genetic_map, mapping):
+    positions, cms = load_genetic_map(genetic_map)
+    table = read_bim(bim)
+    joined = table.join(variant_table(mapping), on='SNP', rsuffix='_expected', validate='one_to_one')
+    alleles_match = ((joined.A1.eq(joined.REF) & joined.A2.eq(joined.ALT))
+                     | (joined.A1.eq(joined.ALT) & joined.A2.eq(joined.REF)))
+    if not (joined.POS.eq(joined.POS_expected) & alleles_match).all():
+        raise ValueError('BIM allele/position mismatch or missing annotation')
+    if table.POS.diff().lt(0).any() or joined.RSID.duplicated().any():
+        raise ValueError('Unsorted/duplicate BIM')
+    table['SNP'] = joined.RSID
+    table['CM'] = np.interp(table.POS, positions, cms)
+    below, above = table.POS.lt(positions[0]), table.POS.gt(positions[-1])
+    exact = table.POS.isin(positions)
+    counts = {'below': int(below.sum()), 'above': int(above.sum()), 'exact': int(exact.sum()),
+              'interpolated': int((~(below | above | exact)).sum())}
+    temporary = bim.with_suffix('.bim.tmp')
+    table.to_csv(temporary, sep='\t', header=False, index=False, float_format='%.10g')
+    temporary.replace(bim)
+    return {key: value for key, value in counts.items() if value}
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--bim", required=True, type=pathlib.Path)
-    parser.add_argument("--genetic-map", required=True, type=pathlib.Path)
-    parser.add_argument("--rsid-map", required=True, type=pathlib.Path)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--bim', type=Path, required=True)
+    parser.add_argument('--genetic-map', type=Path, required=True)
+    parser.add_argument('--rsid-map', type=Path, required=True)
     args = parser.parse_args()
-
-    counts = annotate(
-        args.bim.expanduser().resolve(),
-        args.genetic_map.expanduser().resolve(),
-        args.rsid_map.expanduser().resolve(),
-    )
-    print(
-        f"Annotated {counts['variants']:,} variants: "
-        f"{counts['renamed']:,} rsIDs, "
-        f"{counts['interpolated']:,} interpolated cM, "
-        f"{counts['exact']:,} exact cM, "
-        f"{counts['below'] + counts['above']:,} endpoint cM"
-    )
+    names = pd.read_csv(args.rsid_map, sep=r'\s+', header=None, dtype=str, keep_default_na=False)
+    names.columns = ['old', 'new']
+    if names.old.duplicated().any():
+        raise ValueError('Duplicate source variant IDs')
+    table = read_bim(args.bim)
+    if not names.old.isin(table.SNP).all():
+        raise ValueError('rsID map contains variants absent from BIM')
+    renamed = table.SNP.map(names.set_index('old').new).fillna(table.SNP)
+    mapping = {row.SNP: ((row.POS, row.A1, row.A2), rsid)
+               for row, rsid in zip(table.itertuples(index=False), renamed)}
+    print(annotate(args.bim, args.genetic_map, mapping))
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

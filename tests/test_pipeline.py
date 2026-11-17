@@ -1,4 +1,5 @@
-"""Synthetic correctness tests; no private data or third-party packages needed."""
+"""Synthetic correctness tests; no private data needed."""
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -9,7 +10,8 @@ import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from prepare_panel import chromosome, resolve_panel
-from run_chromosome import annotate, load_panel, match_pvar, samples, sample_ids, validate_zip
+from run_chromosome import annotate, load_panel, match_pvar, samples, sample_ids, validate_zip, load_keep, write_keep
+from prepare_genetic_map import normalize_map, map_statistics
 
 
 class PipelineTests(unittest.TestCase):
@@ -110,6 +112,34 @@ class PipelineTests(unittest.TestCase):
                         '--rsids', str(ids), '--output', str(output)], check=True, capture_output=True)
         self.assertEqual(load_panel(output, 1), {(10, 'A', 'G'): 'rs1'})
         self.assertEqual(json.loads(output.with_suffix('.json').read_text())['resolved'], 1)
+
+    def test_map_normalization_roundtrip_and_validation(self):
+        output = self.root / 'map.tsv'
+        summary = normalize_map(io.BytesIO(b'1 marker1 0.5 10\n1 marker2 1.5 30\n'), output, 1)
+        self.assertEqual(summary, map_statistics(output))
+        self.assertEqual(summary['first'], {'position': 10, 'cm': 0.5})
+        json.dumps(summary)
+        with self.assertRaisesRegex(RuntimeError, 'strictly increasing'):
+            normalize_map(io.BytesIO(b'1 marker1 0.5 10\n1 marker2 1.5 10\n'), output, 1)
+        self.assertEqual(summary, map_statistics(output))  # Invalid input must not overwrite output.
+
+    def test_keep_roundtrip_preserves_literal_na_and_leading_zeros(self):
+        pairs = [('001', '001'), ('NA', 'NA')]
+        filename = self.root / 'samples.keep'
+        write_keep(filename, pairs)
+        self.assertEqual(load_keep(filename), set(pairs))
+        meta = self.write('labels.tsv', 'FID\tIID\tAncestry\n001\t001\tEUR\nNA\tNA\tEUR\n')
+        selected, missing = samples(meta, set(pairs), ['EUR', 'AFR'], set())
+        self.assertEqual(selected, {'EUR': [], 'AFR': []})
+        self.assertEqual(missing, 0)
+
+    def test_annotation_rejects_allele_mismatch_without_overwriting(self):
+        genetic_map = self.write('map.tsv', 'position\tcm\n10\t1\n30\t3\n')
+        bim = self.write('test.bim', '1 id1 0 20 A G\n')
+        original = bim.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'allele/position mismatch'):
+            annotate(bim, genetic_map, {'id1': ((20, 'A', 'C'), 'rs1')})
+        self.assertEqual(bim.read_bytes(), original)
 
     def test_zip_validation(self):
         archive = self.root / 'ld.zip'

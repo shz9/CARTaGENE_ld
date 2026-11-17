@@ -1,8 +1,12 @@
 #!/bin/bash
+# Backward-compatible alias; submission always goes through preparation/validation.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 config=${1:-config/pipeline.json}
 array=${2:-1-22%4}
-[[ -f "$config" ]] || { echo "Missing $config" >&2; exit 1; }
-mkdir -p logs
-sbatch --array="$array" scripts/chromosome.sbatch "$config"
+chromosomes=${array%%%*}
+concurrency=4
+if [[ "$array" == *%* ]]; then concurrency=${array#*%}; fi
+if [[ $# -ge 2 ]]; then shift 2; else shift "$#"; fi
+exec bash scripts/run_pipeline.sh --config "$config" --chromosomes "$chromosomes" \
+  --max-concurrent "$concurrency" "$@"

@@ -3,7 +3,6 @@
 import argparse
 from collections import Counter
 import contextlib
-import csv
 import gzip
 import importlib.metadata
 import json
@@ -15,8 +14,11 @@ import subprocess
 import tempfile
 import zipfile
 
-from annotate_bim import load_genetic_map, interpolate_sorted, format_cm
+import pandas as pd
+
+from annotate_bim import annotate, read_bim, variant_table
 from prepare_panel import chromosome, identity, sha256, RSID
+from ld_blocks import parse_blocks
 
 ROOT = Path(__file__).resolve().parent.parent
 GROUPS = {'AFR', 'AMR', 'CSA', 'EAS', 'EUR', 'MID'}
@@ -49,79 +51,92 @@ def text_file(filename):
             yield handle
 
 
+def read_config(filename):
+    defaults = json.loads((ROOT / 'config/pipeline.json').read_text())
+    config = json.loads(filename.read_text())
+    if set(config) - set(defaults):
+        raise ValueError(f'Unknown configuration keys: {set(config) - set(defaults)}')
+    defaults.update(config)
+    return defaults
+
+
+def validate_config(cfg):
+    groups = cfg['ancestries']
+    if not groups or len(set(groups)) != len(groups) or not set(groups) <= GROUPS:
+        raise ValueError('Invalid ancestries')
+    if cfg['estimator'] not in {'block', 'windowed'}:
+        raise ValueError('Invalid LD estimator')
+    if cfg['storage_dtype'] not in {'int8', 'int16', 'float32', 'float64'}:
+        raise ValueError('Invalid LD storage dtype')
+    for key in ('maf', 'geno', 'mind', 'hard_call_threshold'):
+        if not 0 <= cfg[key] < 0.5:
+            raise ValueError(f'Invalid {key}')
+    if (not 0 < cfg['hwe'] <= 1 or not math.isfinite(cfg['mac']) or cfg['mac'] < 1 or cfg['min_samples'] < 2
+            or not math.isfinite(cfg['window_cm']) or cfg['window_cm'] <= 0):
+        raise ValueError('Invalid QC/LD parameters')
+    if not 0 <= cfg['min_info'] <= 1:
+        raise ValueError('Invalid minimum imputation quality')
+    if cfg['estimator'] == 'block':
+        if not cfg['blocks'] or '{ancestry}' not in cfg['blocks']:
+            raise ValueError('Block file template must contain {ancestry}')
+        sources = cfg['block_ancestry_map']
+        if any(sources.get(g) not in {'AFR', 'EAS', 'EUR', 'SAS'} for g in groups):
+            raise ValueError('Missing or invalid block_ancestry_map entry')
+
+
 def sample_ids(psam):
-    with psam.open() as handle:
-        header = next(handle).split()
-        header[0] = header[0].lstrip('#')
-        if 'IID' not in header:
-            raise ValueError('PSAM missing IID')
-        seen = set()
-        for line in handle:
-            f = dict(zip(header, line.split()))
-            pair = (f.get('FID', '0'), f['IID'])
-            if pair in seen:
-                raise ValueError(f'Duplicate PSAM sample {pair}')
-            seen.add(pair)
-    return seen
+    table = pd.read_csv(psam, sep=r'\s+', dtype=str, keep_default_na=False)
+    table.columns = table.columns.str.lstrip('#')
+    if 'IID' not in table:
+        raise ValueError('PSAM missing IID')
+    if 'FID' not in table:
+        table['FID'] = '0'
+    if table.duplicated(['FID', 'IID']).any():
+        raise ValueError('Duplicate PSAM sample')
+    return set(table[['FID', 'IID']].itertuples(index=False, name=None))
 
 
 def samples(metadata, available, groups, keep=None):
-    selected = {g: [] for g in groups}
-    seen, iids = set(), set()
-    unmatched = 0
-    with metadata.open() as handle:
-        reader = csv.DictReader(handle, delimiter='\t')
-        if not {'FID', 'IID', 'Ancestry'} <= set(reader.fieldnames or []):
-            raise ValueError('Metadata requires FID, IID, Ancestry headers')
-        for row in reader:
-            pair = (row['FID'], row['IID'])
-            if any(not v or any(c.isspace() for c in v) for v in pair):
-                raise ValueError(f'Invalid sample ID {pair}')
-            if pair in seen or pair[1] in iids:
-                raise ValueError(f'Duplicate metadata ID {pair}')
-            seen.add(pair)
-            iids.add(pair[1])
-            group = row['Ancestry']
-            if group not in GROUPS:
-                raise ValueError(f'Unknown ancestry {group!r}')
-            if pair not in available:
-                unmatched += 1
-                continue
-            if group in selected and (keep is None or pair in keep):
-                selected[group].append(pair)
-    return selected, unmatched
+    table = pd.read_csv(metadata, sep='\t', dtype=str, keep_default_na=False)
+    if not {'FID', 'IID', 'Ancestry'} <= set(table.columns):
+        raise ValueError('Metadata requires FID, IID, Ancestry headers')
+    if not table[['FID', 'IID']].apply(lambda col: col.str.fullmatch(r'\S+')).all().all():
+        raise ValueError('Invalid sample ID')
+    if table.IID.duplicated().any():
+        raise ValueError('Duplicate metadata ID')
+    if not table.Ancestry.isin(GROUPS).all():
+        raise ValueError('Unknown ancestry in metadata')
+    pairs = pd.MultiIndex.from_frame(table[['FID', 'IID']])
+    matched = pairs.isin(available)
+    allowed = matched if keep is None else matched & pairs.isin(keep)
+    return {group: list(table.loc[allowed & table.Ancestry.eq(group), ['FID', 'IID']]
+                        .itertuples(index=False, name=None)) for group in groups}, int((~matched).sum())
 
 
 def load_keep(filename):
-    with filename.open() as handle:
-        if next(handle).split() not in (['FID', 'IID'], ['#FID', 'IID']):
-            raise ValueError('Sample keep file requires FID IID header')
-        result = set()
-        for line in handle:
-            fields = line.split()
-            if len(fields) != 2:
-                raise ValueError('Expected FID IID keep rows')
-            result.add(tuple(fields))
-    return result
+    table = pd.read_csv(filename, sep=r'\s+', dtype=str, keep_default_na=False)
+    table.columns = table.columns.str.lstrip('#')
+    if list(table.columns) != ['FID', 'IID']:
+        raise ValueError('Sample keep file requires FID IID header')
+    if not table.apply(lambda col: col.str.fullmatch(r'\S+')).all().all():
+        raise ValueError('Invalid sample keep ID')
+    return set(table.itertuples(index=False, name=None))
 
 
 def load_panel(filename, chrom):
-    panel = {}
-    rsids = set()
-    with filename.open() as handle:
-        for row in csv.DictReader(handle, delimiter='\t'):
-            if int(row['CHROM']) != chrom:
-                continue
-            key = (int(row['POS']), row['REF'], row['ALT'])
-            if key[0] < 1 or len(key[1]) != 1 or len(key[2]) != 1 or key[1] not in 'ACGT' or key[2] not in 'ACGT' or key[1] == key[2] or not RSID.fullmatch(row['RSID']):
-                raise ValueError(f'Invalid panel row {row}')
-            if key in panel or row['RSID'] in rsids:
-                raise ValueError('Ambiguous panel; use prepare_panel.py')
-            panel[key] = row['RSID']
-            rsids.add(row['RSID'])
-    if not panel:
+    # Read only this chromosome into memory, even for multi-million-variant panels.
+    with pd.read_csv(filename, sep='\t', keep_default_na=False, chunksize=250_000,
+                     dtype={'CHROM': 'int64', 'POS': 'int64', 'REF': str, 'ALT': str, 'RSID': str}) as chunks:
+        table = pd.concat([chunk.loc[chunk.CHROM.eq(chrom)] for chunk in chunks], ignore_index=True)
+    if table.empty:
         raise ValueError(f'No panel variants on chromosome {chrom}')
-    return panel
+    valid = (table.POS.gt(0) & table.REF.isin(list('ACGT')) & table.ALT.isin(list('ACGT'))
+             & table.REF.ne(table.ALT) & table.RSID.str.fullmatch(RSID.pattern))
+    if not valid.all():
+        raise ValueError('Invalid panel row')
+    if table.duplicated(['POS', 'REF', 'ALT']).any() or table.RSID.duplicated().any():
+        raise ValueError('Ambiguous panel; use prepare_panel.py')
+    return dict(zip(table[['POS', 'REF', 'ALT']].itertuples(index=False, name=None), table.RSID))
 
 
 def match_pvar(filename, panel, chrom, info_field=None, min_info=0.8):
@@ -174,35 +189,12 @@ def match_pvar(filename, panel, chrom, info_field=None, min_info=0.8):
 
 
 def write_keep(filename, pairs):
-    filename.write_text('#FID\tIID\n' + ''.join(f'{fid}\t{iid}\n' for fid, iid in pairs))
+    pd.DataFrame(pairs, columns=['#FID', 'IID']).to_csv(filename, sep='\t', index=False)
 
 
 def line_count(filename):
     with filename.open() as handle:
         return sum(1 for _ in handle)
-
-
-def annotate(bim, genetic_map, mapping):
-    positions, cms = load_genetic_map(genetic_map)
-    counts, seen = Counter(), set()
-    temporary = bim.with_suffix('.bim.tmp')
-    index, previous = 0, 0
-    with bim.open() as source, temporary.open('w') as output:
-        for line in source:
-            f = line.split()
-            key, rsid = mapping[f[1]]
-            if int(f[3]) != key[0] or {f[4], f[5]} != {key[1], key[2]}:
-                raise ValueError('BIM allele/position mismatch')
-            if key[0] < previous or rsid in seen:
-                raise ValueError('Unsorted/duplicate BIM')
-            previous = key[0]
-            seen.add(rsid)
-            cm, kind, index = interpolate_sorted(key[0], positions, cms, index)
-            counts[kind] += 1
-            f[1], f[2] = rsid, format_cm(cm)
-            output.write('\t'.join(f) + '\n')
-    temporary.replace(bim)
-    return dict(counts)
 
 
 def validate_zip(filename):
@@ -211,10 +203,34 @@ def validate_zip(filename):
             raise ValueError(f'Invalid LD ZIP {filename}')
 
 
+def local_references(cfg, chrom):
+    """Check local inputs before genotype processing; never download on workers."""
+    references = [path(cfg['metadata']), path(cfg['panel']), path(cfg['genetic_map'], chrom)]
+    if cfg['sample_keep']:
+        references.append(path(cfg['sample_keep']))
+    if cfg['estimator'] == 'block':
+        references += [path(cfg['blocks'].replace('{ancestry}', group), chrom)
+                       for group in cfg['ancestries']]
+    missing = [str(f) for f in references if not f.is_file() or f.stat().st_size == 0]
+    if missing:
+        raise FileNotFoundError('Missing local references: ' + ', '.join(missing)
+                                + '. Run bash scripts/prepare_references.sh on the login node first.')
+    if cfg['estimator'] == 'block':
+        for group in cfg['ancestries']:
+            blockfile = path(cfg['blocks'].replace('{ancestry}', group), chrom)
+            parse_blocks(blockfile.read_text(), chrom=chrom)
+    return references
+
+
 def compute_ld(bfile, output, temporary, cfg, chrom, group, threads):
     import magenpy as mgp
     import zarr
-    kwargs = {'cm_window_size': cfg['window_cm']} if cfg['estimator'] == 'windowed' else {'ld_blocks_file': str(path(cfg['blocks'].replace('{ancestry}', group), chrom))}
+    if cfg['estimator'] == 'windowed':
+        kwargs = {'cm_window_size': cfg['window_cm']}
+    else:
+        blockfile = path(cfg['blocks'].replace('{ancestry}', group), chrom)
+        parse_blocks(blockfile.read_text(), chrom=chrom)
+        kwargs = {'ld_blocks_file': str(blockfile)}
     loader = mgp.GWADataLoader(bed_files=str(bfile), backend='magenpy', threads=threads,
                                temp_dir=str(temporary), genome_build='GRCh38')
     try:
@@ -226,6 +242,9 @@ def compute_ld(bfile, output, temporary, cfg, chrom, group, threads):
         for matrix in matrices.values():
             matrix.set_store_attr('Biobank', 'CARTaGENE')
             matrix.set_store_attr('Ancestry', group)
+            ld_variants = int(matrix.shape[0])
+            if cfg['estimator'] == 'block':
+                matrix.set_store_attr('LD block file SHA256', sha256(blockfile))
             zarr.consolidate_metadata(matrix._zg.store)
             store = Path(matrix._zarr_store_path(matrix._zg.store))
             archive = output / f'chr_{chrom}.zip'
@@ -241,27 +260,15 @@ def compute_ld(bfile, output, temporary, cfg, chrom, group, threads):
     for entry in output.iterdir():
         if entry.is_dir():
             shutil.rmtree(entry)
+    return ld_variants
 
 
 def run(args):
-    cfg = json.loads(path(args.config).read_text())
-    defaults = json.loads((ROOT / 'config/pipeline.json').read_text())
-    unknown = set(cfg) - set(defaults)
-    if unknown:
-        raise ValueError(f'Unknown configuration keys: {unknown}')
-    defaults.update(cfg)
-    cfg = defaults
-    if not cfg['ancestries'] or len(set(cfg['ancestries'])) != len(cfg['ancestries']) or not set(cfg['ancestries']) <= GROUPS:
-        raise ValueError('Invalid ancestries')
-    if cfg['estimator'] not in ('windowed', 'block') or (cfg['estimator'] == 'block' and not cfg['blocks']):
-        raise ValueError('Use windowed LD or provide block file template with {ancestry}')
-    for name in ('maf', 'geno', 'mind', 'hard_call_threshold'):
-        if not 0 <= cfg[name] < 0.5:
-            raise ValueError(f'Invalid {name}')
-    if not 0 < cfg['hwe'] <= 1 or cfg['mac'] < 1 or cfg['min_samples'] < 2 or cfg['window_cm'] <= 0 or args.threads < 1:
-        raise ValueError('Invalid QC/LD parameters')
-    if cfg['storage_dtype'] not in ('int8', 'int16', 'float32', 'float64'):
-        raise ValueError('Invalid storage dtype')
+    cfg = read_config(path(args.config))
+    validate_config(cfg)
+    if args.threads < 1:
+        raise ValueError('Thread count must be positive')
+    references = local_references(cfg, args.chrom)
     prefix = path(cfg['input_prefix'], args.chrom)
     pgen, psam = Path(str(prefix) + '.pgen'), Path(str(prefix) + '.psam')
     pvars = [Path(str(prefix) + ext) for ext in ('.pvar', '.pvar.gz', '.pvar.zst')]
@@ -269,11 +276,6 @@ def run(args):
     if len(pvars) != 1:
         raise ValueError(f'Expected exactly one PVAR: {pvars}')
     pvar = pvars[0]
-    references = [path(cfg['metadata']), path(cfg['panel']), path(cfg['genetic_map'], args.chrom)]
-    if cfg['sample_keep']:
-        references.append(path(cfg['sample_keep']))
-    if cfg['estimator'] == 'block':
-        references += [path(cfg['blocks'].replace('{ancestry}', g), args.chrom) for g in cfg['ancestries']]
     version = subprocess.check_output([args.plink, '--version'], text=True).strip()
     if 'PLINK v2' not in version:
         raise ValueError(f'Expected PLINK2: {version}')
@@ -320,12 +322,12 @@ def run(args):
             selected, unmatched = samples(path(cfg['metadata']), available, cfg['ancestries'], keep)
             summary['unmatched_metadata'] = unmatched
             summary['psam_samples'] = len(available)
-            summary['requested_panel_variants'] = len(load_panel(path(cfg['panel']), args.chrom))
             all_pairs = [pair for pairs in selected.values() for pair in pairs]
             if not all_pairs:
                 raise ValueError('No selected samples intersect PSAM; check FID/IID conventions')
             write_keep(work / 'all.keep', all_pairs)
             panel = load_panel(path(cfg['panel']), args.chrom)
+            summary['requested_panel_variants'] = len(panel)
             mapping, summary['panel_match'] = match_pvar(pvar, panel, args.chrom, cfg['info_field'], cfg['min_info'])
             (work / 'extract.txt').write_text(''.join(old + '\n' for old in mapping))
             shared = work / 'shared'
@@ -358,14 +360,12 @@ def run(args):
                     stats.update(status='skipped', reason='Fewer than two QC variants')
                     continue
                 # Record source alleles before replacing IDs in BIM.
-                with (folder / 'qc.bim').open() as handle, (folder / 'variants.tsv').open('w') as output:
-                    output.write('ORIGINAL_ID\tRSID\tCHROM\tPOS\tREF\tALT\n')
-                    for line in handle:
-                        old = line.split()[1]
-                        (pos, ref, alt), rsid = mapping[old]
-                        output.write(f'{old}\t{rsid}\t{args.chrom}\t{pos}\t{ref}\t{alt}\n')
+                variants = variant_table(mapping).loc[read_bim(folder / 'qc.bim').SNP].reset_index()
+                variants.insert(2, 'CHROM', args.chrom)
+                variants.to_csv(folder / 'variants.tsv', sep='\t', index=False)
                 stats['map'] = annotate(folder / 'qc.bim', path(cfg['genetic_map'], args.chrom), mapping)
-                compute_ld(folder / 'qc', folder / 'ld', folder / 'temp', cfg, args.chrom, group, args.threads)
+                stats['ld_variants'] = compute_ld(folder / 'qc', folder / 'ld', folder / 'temp', cfg, args.chrom, group, args.threads)
+                stats['variants_excluded_by_blocks'] = stats['variants'] - stats['ld_variants']
                 stats['status'] = 'complete'
                 if stats['samples_after_qc'] < 1000:
                     stats['warning'] = 'Small ancestry sample; assess LD stability'

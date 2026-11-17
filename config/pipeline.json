@@ -23,10 +23,18 @@
   "info_field": null,
   "min_info": 0.8,
   "min_samples": 100,
-  "estimator": "windowed",
+  "estimator": "block",
   "window_cm": 3,
-  "blocks": null,
-  "storage_dtype": "int16",
+  "blocks": "data/blocks/{ancestry}.bed",
+  "block_ancestry_map": {
+    "AFR": "AFR",
+    "AMR": "AFR",
+    "CSA": "SAS",
+    "EAS": "EAS",
+    "EUR": "EUR",
+    "MID": "EUR"
+  },
+  "storage_dtype": "int8",
   "retain_bed": false,
   "run_tag": "v1"
 }

@@ -29,14 +29,30 @@ class NativeLDTest(unittest.TestCase):
                 for j in range(6):
                     for i in range(0, 40, 4):
                         handle.write(bytes([sum(encoding[int(dosage[i+k, j])] << (2*k) for k in range(4))]))
-            cfg = {'estimator': 'windowed', 'window_cm': 3, 'storage_dtype': 'int16'}
-            compute_ld(prefix, root / 'ld', root / 'tmp', cfg, 22, 'EUR', 2)
-            archive = root / 'ld/chr_22.zip'
-            ld = mgp.LDMatrix.from_path(str(archive))
-            observed = ld.to_csr(dtype='float64', return_symmetric=True).toarray()
-            np.testing.assert_allclose(observed, np.corrcoef(dosage, rowvar=False), atol=0.0001)
-            self.assertEqual(ld.get_store_attr('Ancestry'), 'EUR')
-            self.assertEqual(list((root / 'ld').iterdir()), [archive])
+            cases = [('windowed', 'int16', 'EUR', None),
+                     ('block', 'int8', 'EUR', 103), ('block', 'int8', 'AFR', 102)]
+            for estimator, dtype, group, split in cases:
+                with self.subTest(estimator=estimator, dtype=dtype, ancestry=group):
+                    if split is not None:
+                        (root / f'{group}.bed').write_text(
+                            f'chr\tstart\tstop\n22\t90\t{split}\n22\t{split}\t110\n')
+                    cfg = {'estimator': estimator, 'window_cm': 3, 'storage_dtype': dtype,
+                           'blocks': str(root / '{ancestry}.bed')}
+                    output = root / f'{estimator}-{group}'
+                    compute_ld(prefix, output, root / 'tmp', cfg, 22, group, 2)
+                    archive = output / 'chr_22.zip'
+                    ld = mgp.LDMatrix.from_path(str(archive))
+                    observed = ld.to_csr(dtype='float64', return_symmetric=True).toarray()
+                    expected = np.corrcoef(dosage, rowvar=False)
+                    if split is not None:
+                        nleft = split - 100
+                        expected[:nleft, nleft:] = 0
+                        expected[nleft:, :nleft] = 0
+                    np.testing.assert_allclose(observed, expected, atol=0.008 if dtype == 'int8' else 0.0001)
+                    self.assertEqual(str(ld.stored_dtype), dtype)
+                    self.assertEqual(ld.get_store_attr('Ancestry'), group)
+                    self.assertEqual(list(output.iterdir()), [archive])
+
 
 
 if __name__ == '__main__':
