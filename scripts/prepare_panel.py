@@ -5,6 +5,7 @@ from collections import Counter
 import gzip
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 
@@ -85,6 +86,21 @@ def read_rsids(paths):
     return wanted
 
 
+def verify_dbsnp(vcf):
+    """Verify a local checksum on the compute node, never scan the VCF on login."""
+    checksum_file = Path(str(vcf) + '.md5')
+    if not checksum_file.is_file():
+        return  # Independently supplied local VCFs may have been verified upstream.
+    expected = re.search(r'\b[a-fA-F0-9]{32}\b', checksum_file.read_text())
+    if expected is None:
+        raise ValueError(f'Invalid checksum file: {checksum_file}')
+    print(f'Verifying dbSNP MD5: {vcf}', flush=True)
+    with vcf.open('rb') as handle:
+        observed = hashlib.file_digest(handle, 'md5').hexdigest()
+    if observed.lower() != expected.group().lower():
+        raise ValueError(f'dbSNP checksum mismatch: {vcf}; replace/redownload the invalid file')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--assembly', choices=['GRCh38'], required=True)
@@ -92,10 +108,16 @@ def main():
     parser.add_argument('--rsids', type=Path, nargs='+', required=True)
     parser.add_argument('--output', type=Path, default=Path('data/reference/panel.grch38.tsv'))
     args = parser.parse_args()
+    if not os.environ.get('SLURM_JOB_ID'):
+        raise SystemExit('Panel preparation requires a SLURM job. Use bash scripts/run_pipeline.sh on the login node.')
+    before = [identity(p) for p in [args.dbsnp_vcf, *args.rsids]]
+    verify_dbsnp(args.dbsnp_vcf)
     wanted = read_rsids(args.rsids)
     rows, summary = resolve_panel(args.dbsnp_vcf, wanted)
     if not rows:
         raise ValueError('No usable panel variants resolved')
+    if before != [identity(p) for p in [args.dbsnp_vcf, *args.rsids]]:
+        raise ValueError('Panel inputs changed during preparation; rerun with fixed inputs')
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix('.tmp')
     pd.DataFrame.from_records([(*key, rsid) for key, rsid in rows], columns=COLUMNS).to_csv(
@@ -103,8 +125,11 @@ def main():
     temporary.replace(args.output)
     summary.update(assembly=args.assembly, dbsnp=identity(args.dbsnp_vcf),
                    lists=[dict(identity(p), sha256=sha256(p)) for p in args.rsids],
-                   panel_sha256=sha256(args.output))
-    args.output.with_suffix('.json').write_text(json.dumps(summary, indent=2) + '\n')
+                   panel=identity(args.output), panel_sha256=sha256(args.output),
+                   chromosomes=dict(Counter(key[0] for key, _ in rows)))
+    receipt = args.output.with_suffix('.json.tmp')
+    receipt.write_text(json.dumps(summary, indent=2) + '\n')
+    receipt.replace(args.output.with_suffix('.json'))
     print(json.dumps(summary, indent=2))
 
 

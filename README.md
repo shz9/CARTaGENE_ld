@@ -13,7 +13,7 @@ The repository includes the SNP list at `metadata/rsids.txt`, configured by the
 metadata, then run:
 
 ```bash
-# Pilot: prepare/check dependencies and inputs, then submit chromosome 22.
+# Pilot: if panel preparation is needed, submit it and stop; otherwise submit LD.
 bash scripts/run_pipeline.sh --chromosomes 22
 
 # Production: reuse the prepared panel when its source list is unchanged.
@@ -22,40 +22,67 @@ bash scripts/run_pipeline.sh --chromosomes 1-22 --max-concurrent 4
 # Validate existing dependencies and inputs without downloading or submitting.
 bash scripts/run_pipeline.sh --chromosomes 22 --check-only
 
-# Prepare and validate everything, stopping before submission.
+# Prepare references (may submit a panel job), without submitting LD.
 bash scripts/run_pipeline.sh --chromosomes 22 --prepare-only
 ```
 
-This entry point loads the Python/PLINK modules, creates or repairs the Python
-environment when needed, checks installed dependencies and the compiled native
-LD backend, validates metadata and **all requested genotype triplets**, prepares
-missing references, validates them, and submits a SLURM array only after every
-check succeeds. A failure prevents submission of the entire requested array.
-`--check-only` still writes a validation report to `logs/preflight.json` and checks
-that output/log/scratch directories are writable; it installs/downloads nothing.
-An explicitly configured scratch directory is checked on the login node;
-otherwise jobs rely on the scheduler-provided `SLURM_TMPDIR`.
+This entry point loads the Python/PLINK modules, sets up or checks the environment,
+checks metadata and genotype headers, and performs small reference downloads on
+the login node. **The full dbSNP scan, checksum verification, and rsID panel
+construction run only in a SLURM job.** PVAR scans, full panel validation and LD
+computation also run on compute nodes.
 
-Use `--config FILE` for alternate settings, `--chromosomes 1-3,22` to select
-chromosomes, and `--max-concurrent N` to limit simultaneous jobs. Normal successful
-runs **submit jobs automatically**. `logs/preflight.json` records validation details
-and the submitted job ID. Jobs receive a snapshot of the validated configuration.
-`submit.sh` remains an alias for this workflow; direct `sbatch` is an advanced
-path that bypasses the login-node checks.
+If the panel is missing or stale, the script ensures the VCF is local, submits
+`scripts/prepare_panel.sbatch`, prints the job ID and a request to wait, and exits.
+**No LD jobs are submitted in that invocation.** Wait for completion, check
+`logs/panel-<job-id>.out`, then rerun the same command. For example:
 
-The default rsID source is `metadata/rsids.txt`; no `--rsids` argument is needed.
-Change the `rsids` list in the configuration or pass `--rsids FILE [FILE...]` to
-override it. The source list is checked against the panel receipt on each run;
-changes trigger a panel rebuild (or a stale-panel error in `--check-only` mode).
-Set `rsids` to `[]` only when supplying an independently prepared panel without
-source lists. The default dbSNP location is
-`data/reference/GCF_000001405.40.gz`. If absent, the script downloads it on the
-login node with resume support and verifies the source's accompanying MD5 before
-use. Set `--dbsnp-vcf /path/to/existing/GRCh38.vcf.gz` to reuse a verified local copy,
-or `--dbsnp-url URL` to choose a GRCh38 release (with an accompanying `URL.md5`).
-Existing local VCFs are assumed to have been verified by you. A supplied panel is
-validated without requiring the full VCF; when source lists are configured or supplied, their
-hashes, the panel receipt, and available VCF metadata determine whether to rebuild.
+```bash
+bash scripts/run_pipeline.sh --chromosomes 22
+# If a panel job was submitted, wait and inspect its progress:
+squeue -j <job-id>
+# After it finishes successfully:
+bash scripts/run_pipeline.sh --chromosomes 22
+```
+
+Rerunning while that panel job is queued/running reports the existing job instead
+of submitting it again, including when its source list has changed. If it fails,
+inspect its log, fix the cause, and rerun; the script can resubmit preparation.
+Panel-job state is stored under `logs/panel-<output-path-hash>.json`. If SLURM
+status cannot be queried, the script fails rather than risk a duplicate job.
+
+Default panel allocation: **1 CPU, 32 GiB RAM, 5 hours**, adjustable in
+`prepare_panel.sbatch`. It uses the same Python module and environment as LD jobs.
+All panel-job inputs must be on shared storage; it performs no downloads.
+Only after a completed panel is available and the lightweight checks succeed
+does a normal run submit the LD chromosome array. `--prepare-only` can submit a
+panel preparation job but never LD jobs. `--check-only` never installs, downloads,
+or submits anything; a missing/stale panel fails validation. Successful checks
+write `logs/preflight.json` and check that log/output/configured scratch directories
+are writable. Jobs otherwise rely on scheduler-provided `SLURM_TMPDIR`.
+
+Use `--config FILE`, `--chromosomes 1-3,22`, and `--max-concurrent N` as needed.
+`logs/preflight.json` records `awaiting_panel` or the validated LD submission/job ID.
+LD jobs receive a snapshot of the validated configuration. `submit.sh` is an alias
+for this workflow; direct `sbatch` bypasses login-node preflight.
+
+The default rsID source is `metadata/rsids.txt`. Change `rsids` in the configuration
+or use `--rsids FILE [FILE...]`. Login-node freshness checks compare file paths,
+sizes and modification times against a completion receipt; they do not load the
+rsID lists or hash the full panel. Input changes trigger another preparation job.
+Hashes and per-chromosome variant counts are recorded by the compute job. Files
+modified without changing size/mtime cannot be detected by these lightweight checks;
+remove the panel receipt to force regeneration. Older receipts without panel-file
+metadata require a one-time rebuild. Set `rsids` to `[]` only for an independently
+prepared panel; its full validation is deferred to the chromosome jobs.
+
+The default dbSNP location is `data/reference/GCF_000001405.40.gz`. If absent, the
+login script downloads it with resume support and saves the accompanying MD5.
+**The checksum scan is deferred to the panel job.** Use `--dbsnp-vcf FILE` to reuse
+a local GRCh38 VCF, or `--dbsnp-url URL` for another release with `URL.md5`.
+If a local `<VCF>.md5` exists, the compute job verifies it; otherwise independently
+provided VCFs are assumed to have been verified upstream. A completed panel can
+be reused without keeping the full source VCF.
 
 Genotype checks inspect readability, PGEN magic bytes, PVAR headers/first records,
 PSAM IDs, and ancestry intersections. They do **not** scan the full PGEN/PVAR or
@@ -150,7 +177,7 @@ Create a persistent environment once **on the login node**:
 bash scripts/setup_env.sh
 ```
 
-Environment setup, reference preparation, and chromosome jobs each load
+Environment setup, reference downloads, panel preparation, and LD jobs each load
 `python/3.13` before invoking Python. Setup uses that module's `python3` to create
 `env/ld`; subsequent steps use `env/ld/bin/python` with the same module loaded.
 To use another supported module (Python 3.11–3.13), export `PYTHON_MODULE` before
@@ -158,42 +185,46 @@ setup, preparation, and submission, for example `export PYTHON_MODULE=python/3.1
 Recreate the environment when changing Python versions. Load any additional
 compiler modules required by your cluster before setup.
 
-This installs pinned magenpy 0.2.5 and Zarr v2 in `env/ld`. Jobs use `module load
+Setup installs binary wheels for magenpy 0.2.5 and Zarr v2 in `env/ld`; it fails
+if suitable wheels are unavailable rather than compiling on the login node. Jobs use `module load
 plink` and resolve `plink2` or `plink` from that module, verifying it is PLINK v2.
 No PLINK download is performed. This venv route avoids assuming an available Docker
 image/tag or compute-node network access. It must be compatible with compute nodes.
 
-## Prepare public references on the login node
+## Reference downloads and scheduled preparation
 
-**Compute nodes have no internet access.** Run environment setup, all downloads,
-and reference preparation directly on the login node before submitting LD jobs.
-Do not use `sbatch` for these steps. The preparation entry points reject invocation
-inside a SLURM job. There is no download fallback in the chromosome jobs: missing
-local references cause an early failure with preparation instructions.
+Compute nodes have no internet access. Download public reference files on the
+login node; keep them and `env/ld` on storage visible to compute nodes. Small
+block/map tables can be normalized there. Full database scans and large panel
+operations must run under SLURM. The unified entry point handles this split.
 
-The bundled `metadata/rsids.txt` contains one rsID per line, without a header
-(blank lines and # comments are allowed). Additional lists can be selected through
-`rsids` in the configuration or `--rsids`. Obtain a GRCh38
-dbSNP VCF from [NCBI](https://ftp.ncbi.nlm.nih.gov/snp/latest_release/VCF/) on the
-login node, record its release/checksum, and verify the assembly. This is a large
-download; reuse the verified HGDP+1KG copy if available. For example, on the login node:
+The bundled `metadata/rsids.txt` uses one rsID per line, no header (blank lines
+and # comments allowed). For an existing GRCh38 dbSNP copy, use:
 
 ```bash
-mkdir -p data/reference
-curl --fail --location --continue-at - \
-  --output data/reference/GCF_000001405.40.gz \
-  https://ftp.ncbi.nlm.nih.gov/snp/latest_release/VCF/GCF_000001405.40.gz
-# Verify the downloaded release against NCBI's accompanying checksum before use.
-bash scripts/prepare_references.sh data/reference/GCF_000001405.40.gz \
-  metadata/rsids.txt
+bash scripts/run_pipeline.sh --chromosomes 22 --dbsnp-vcf /shared/GRCh38.vcf.gz
 ```
 
-The login-node script downloads and normalizes the Beagle GRCh38 genetic map and
-ancestry-matched LD blocks, then streams the local dbSNP VCF to build
-`data/reference/panel.grch38.tsv`. The full dbSNP scan may take hours; allocate
-sufficient login-node resources according to cluster policy. This replaces the
-former `prepare_references.sbatch` workflow. All reference outputs and `env/ld`
-must be on storage visible to compute nodes.
+The legacy preparation wrapper delegates to the unified entry point with
+`--prepare-only`; it also schedules panel preparation and returns rather than
+scanning dbSNP on login:
+
+```bash
+bash scripts/prepare_references.sh /shared/GRCh38.vcf.gz metadata/rsids.txt
+```
+
+For manual submission when all source files and the Python environment are local:
+
+```bash
+mkdir -p logs
+sbatch scripts/prepare_panel.sbatch /shared/GRCh38.vcf.gz \
+  data/reference/panel.grch38.tsv metadata/rsids.txt
+```
+
+`prepare_panel.py` itself refuses to run outside a SLURM job. Its JSON completion
+receipt is published only after the panel succeeds. A failed or interrupted job
+leaves no current receipt, so it cannot enable LD submission. Do not run heavy
+checksum or panel validation commands on the login node.
 
 LD blocks come from [LDblocks_GRCh38](https://github.com/jmacdon/LDblocks_GRCh38),
 using **pyrho** boundaries. The `block_ancestry_map` object in
@@ -215,7 +246,7 @@ to regenerate affected files. Outputs retain the CARTaGENE ancestry names, so
 `blocks: "data/blocks/{ancestry}.bed"` continues to work for chromosome jobs.
 For a different configuration, use `prepare_blocks.py --config /path/to/pipeline.json`
 or `bash scripts/prepare_references.sh --config /path/to/pipeline.json VCF panel...`.
-The preparation wrapper's other reference destinations remain the standard paths.
+The preparation wrapper honors the unified workflow’s configured reference paths.
 
 The proxies preserve the previous pipeline's choices; they are not independently
 estimated CARTaGENE or admixed-population boundaries. Source coordinates are

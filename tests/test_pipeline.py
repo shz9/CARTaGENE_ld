@@ -1,6 +1,7 @@
 """Synthetic correctness tests; no private data needed."""
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -109,9 +110,20 @@ class PipelineTests(unittest.TestCase):
         output = self.root / 'panel.tsv'
         script = Path(__file__).resolve().parents[1] / 'scripts/prepare_panel.py'
         subprocess.run([sys.executable, str(script), '--assembly', 'GRCh38', '--dbsnp-vcf', str(vcf),
-                        '--rsids', str(ids), '--output', str(output)], check=True, capture_output=True)
+                        '--rsids', str(ids), '--output', str(output)], check=True, capture_output=True,
+                       env=dict(os.environ, SLURM_JOB_ID='synthetic-test'))
         self.assertEqual(load_panel(output, 1), {(10, 'A', 'G'): 'rs1'})
         self.assertEqual(json.loads(output.with_suffix('.json').read_text())['resolved'], 1)
+
+    def test_panel_cli_rejects_login_node_execution(self):
+        script = Path(__file__).resolve().parents[1] / 'scripts/prepare_panel.py'
+        env = dict(os.environ)
+        env.pop('SLURM_JOB_ID', None)
+        result = subprocess.run([sys.executable, str(script), '--assembly', 'GRCh38',
+                                 '--dbsnp-vcf', '/unused', '--rsids', '/unused'],
+                                capture_output=True, text=True, env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('requires a SLURM job', result.stderr)
 
     def test_map_normalization_roundtrip_and_validation(self):
         output = self.root / 'map.tsv'

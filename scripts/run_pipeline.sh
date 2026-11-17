@@ -16,9 +16,10 @@ Usage: bash scripts/run_pipeline.sh [options]
   --dbsnp-vcf FILE       Local GRCh38 VCF (default: data/reference/GCF_000001405.40.gz)
   --dbsnp-url URL        Download URL if the VCF is missing; fetches URL.md5 as well
   --check-only          Validate existing inputs; no installation/download/submission
-  --prepare-only        Prepare and validate inputs without submitting
+  --prepare-only        Prepare references (may submit a panel job); no LD jobs
   --help                Show this help
-All preparation runs on the login node. Successful normal runs submit a SLURM array.
+Downloads run on login; panel preparation runs in SLURM.
+If a panel job is needed, this command submits it and exits: wait, then rerun for LD.
 Set PYTHON_MODULE to override python/3.13 consistently for setup and jobs.
 HELP
   exit 0

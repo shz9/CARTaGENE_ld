@@ -19,11 +19,10 @@ from annotate_bim import load_genetic_map
 from magenpy import __version__ as magenpy_version
 from magenpy.stats.ld import c_utils  # Verify the compiled native LD extension imports.
 from prepare_blocks import prepare as prepare_blocks
-from prepare_panel import chromosome, identity, read_rsids, sha256
+from prepare_panel import chromosome, identity, sha256
 from run_chromosome import (
     ROOT,
     load_keep,
-    load_panel,
     local_references,
     path,
     read_config,
@@ -155,27 +154,61 @@ def validate_genotypes(cfg, chroms):
 
 
 def panel_current(panel, rsids, vcf):
-    if not panel.is_file():
+    """Lightweight receipt/stat check; full scans belong on compute nodes."""
+    if not panel.is_file() or not panel.stat().st_size:
         return False
     if not rsids:
-        return (
-            True  # An explicitly prepared panel can be supplied without its source VCF.
-        )
-    receipt = panel.with_suffix(".json")
+        return True  # An independently prepared panel may omit its source lists.
+    receipt = panel.with_suffix('.json')
     if not receipt.is_file():
         return False
-    report = json.loads(receipt.read_text())
-    lists = [dict(identity(p), sha256=sha256(p)) for p in rsids]
-    return (
-        report.get("assembly") == "GRCh38"
-        and report.get("lists") == lists
-        and report.get("panel_sha256") == sha256(panel)
-        and (not vcf.exists() or report.get("dbsnp") == identity(vcf))
-    )
+    try:
+        report = json.loads(receipt.read_text())
+    except (ValueError, OSError):
+        return False
+    recorded = [{k: row.get(k) for k in ('path', 'size', 'mtime_ns')}
+                for row in report.get('lists', [])]
+    return (report.get('assembly') == 'GRCh38'
+            and recorded == [identity(p) for p in rsids]
+            and report.get('panel') == identity(panel)
+            and (not vcf.exists() or report.get('dbsnp') == identity(vcf)))
+
+
+def panel_job_active(job_id):
+    queued = subprocess.run(['squeue', '--noheader', '--jobs', job_id, '--format=%T'],
+                            text=True, capture_output=True, check=True)
+    return bool(queued.stdout.strip())
+
+
+def submit_panel(panel, rsids, vcf):
+    inputs = {'panel': str(panel.resolve()), 'vcf': identity(vcf),
+              'lists': [identity(p) for p in rsids],
+              'code': sha256(ROOT / 'scripts/prepare_panel.py')}
+    token = hashlib.sha256(str(panel.resolve()).encode()).hexdigest()[:16]
+    logs = ROOT / 'logs'
+    logs.mkdir(parents=True, exist_ok=True)
+    receipt = logs / f'panel-{token}.json'
+    if receipt.is_file():
+        state = json.loads(receipt.read_text())
+        if panel_job_active(state['job_id']):
+            print(f'Panel preparation job {state["job_id"]} is still queued/running. '
+                  'Please wait until it completes, then rerun the same pipeline command.', flush=True)
+            return
+    submitted = command('sbatch', '--parsable', ROOT / 'scripts/prepare_panel.sbatch',
+                        vcf, panel, *rsids, capture_output=True)
+    job_id = submitted.stdout.strip().split(';')[0]
+    if not job_id.isdigit():
+        raise ValueError(f'Unexpected sbatch response: {submitted.stdout!r}')
+    state = dict(inputs, job_id=job_id, status='awaiting_panel')
+    receipt.write_text(json.dumps(state, indent=2) + '\n')
+    (logs / 'preflight.json').write_text(json.dumps(state, indent=2) + '\n')
+    print(f'Submitted panel preparation job {job_id}. Please wait until it completes, '
+          f'check logs/panel-{job_id}.out, then rerun the same pipeline command. '
+          'No LD jobs have been submitted.', flush=True)
 
 
 def download_dbsnp(url, destination):
-    """Resume the large download with curl and verify the accompanying NCBI MD5."""
+    """Download on login; save the expected MD5 for verification in the panel job."""
     if not shutil.which("curl"):
         raise FileNotFoundError(
             "curl is required to download dbSNP; or supply a local --dbsnp-vcf"
@@ -199,10 +232,6 @@ def download_dbsnp(url, destination):
         partial,
         url,
     )
-    with partial.open("rb") as handle:
-        observed = hashlib.file_digest(handle, "md5").hexdigest()
-    if observed.lower() != checksum.lower():
-        raise ValueError(f"dbSNP checksum mismatch: {partial}; no jobs submitted")
     partial.replace(destination)
     Path(str(destination) + ".md5").write_text(f"{checksum}  {destination.name}\n")
 
@@ -219,23 +248,10 @@ def prepare_references(cfg, chroms, args):
             )
         if not rsids:
             raise ValueError("Supply --rsids FILE [FILE...] to build the missing panel")
-        read_rsids(
-            rsids
-        )  # Reject invalid/empty lists before downloading the large VCF.
         if not vcf.is_file():
             download_dbsnp(args.dbsnp_url, vcf)
-        command(
-            sys.executable,
-            ROOT / "scripts/prepare_panel.py",
-            "--assembly",
-            "GRCh38",
-            "--dbsnp-vcf",
-            vcf,
-            "--rsids",
-            *rsids,
-            "--output",
-            panel,
-        )
+        submit_panel(panel, rsids, vcf)
+        return False  # Stop after scheduling preparation; never submit LD jobs yet.
     maps = {c: path(cfg["genetic_map"], c) for c in chroms}
     if not all(p.is_file() for p in maps.values()):
         if args.check_only:
@@ -266,11 +282,10 @@ def prepare_references(cfg, chroms, args):
     for chrom in chroms:
         local_references(cfg, chrom)
         load_genetic_map(maps[chrom])
-        panel_variants = len(load_panel(panel, chrom))
-        print(
-            f"chr{chrom}: references valid; {panel_variants:,} panel variants",
-            flush=True,
-        )
+        with panel.open() as handle:
+            if handle.readline().split() != ['CHROM', 'POS', 'REF', 'ALT', 'RSID']:
+                raise ValueError(f'Invalid prepared panel header: {panel}')
+        print(f'chr{chrom}: local reference headers valid; full panel validation runs in the LD job', flush=True)
     if cfg["estimator"] == "block":
         # Prevent a config edit from silently using blocks prepared under an old mapping.
         manifest = ROOT / "data/blocks/summary.json"
@@ -289,6 +304,8 @@ def prepare_references(cfg, chroms, args):
                     raise ValueError(
                         f"Stale/mismatched blocks for {group}; run preparation again"
                     )
+
+    return True
 
 
 def writable_directory(directory):
@@ -309,7 +326,7 @@ def main():
     parser.add_argument("--dbsnp-url", default=DEFAULT_DBSNP_URL)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check-only", action="store_true")
-    mode.add_argument("--prepare-only", action="store_true")
+    mode.add_argument("--prepare-only", action="store_true", help="Prepare references (may submit a panel job); do not submit LD jobs")
     args = parser.parse_args()
     if args.max_concurrent < 1:
         parser.error("--max-concurrent must be positive")
@@ -324,10 +341,11 @@ def main():
         [plink, "--version"], text=True
     ):
         raise ValueError("Load a PLINK2 module before running the pipeline")
-    if not args.prepare_only and not args.check_only and not shutil.which("sbatch"):
+    if not args.check_only and not shutil.which("sbatch"):
         raise FileNotFoundError("sbatch is unavailable")
     genotypes = validate_genotypes(cfg, args.chromosomes)
-    prepare_references(cfg, args.chromosomes, args)
+    if not prepare_references(cfg, args.chromosomes, args):
+        return
     writable_directory(path(cfg["output_dir"]))
     writable_directory(ROOT / "logs")
     if cfg["scratch_dir"]:

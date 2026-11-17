@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import run_pipeline as pipeline
 import run_chromosome
 from prepare_blocks import RAW
-from prepare_panel import identity, sha256
+from prepare_panel import identity, sha256, verify_dbsnp
 
 
 class SubmissionTests(unittest.TestCase):
@@ -32,6 +32,7 @@ class SubmissionTests(unittest.TestCase):
         self.cfg = cfg
         self.config = self.root / 'config.json'
         self.config.write_text(json.dumps(cfg))
+        self.write('scripts/prepare_panel.py', '# synthetic code fingerprint\n')
         self.write('metadata.tsv', 'FID\tIID\tAncestry\n001\t001\tEUR\n002\t002\tEUR\n')
         self.write('chr22.psam', '#FID IID SEX\n001 001 1\n002 002 2\n')
         (self.root / 'chr22.pgen').write_bytes(b'\x6c\x1b\x10test')
@@ -41,7 +42,7 @@ class SubmissionTests(unittest.TestCase):
         ids = self.write('metadata/rsids.txt', 'rs1\nrs2\n')
         self.write('panel.json', json.dumps({
             'assembly': 'GRCh38', 'lists': [dict(identity(ids), sha256=sha256(ids))],
-            'panel_sha256': sha256(self.root / 'panel.tsv')}))
+            'panel': identity(self.root / 'panel.tsv'), 'panel_sha256': sha256(self.root / 'panel.tsv')}))
         blocks = self.write('data/blocks/EUR.bed', 'chr\tstart\tstop\n' + ''.join(f'{c}\t1\t1000\n' for c in range(1, 23)))
         self.write('data/blocks/summary.json', json.dumps({'ancestries': {'EUR': {
             'source_ancestry': 'EUR', 'url': RAW + 'pyrho_EUR_LD_blocks.bed', 'sha256': sha256(blocks)}}}))
@@ -120,7 +121,7 @@ class SubmissionTests(unittest.TestCase):
         override = self.write('alternate.txt', 'rs1\nrs2\n')
         self.write('panel.json', json.dumps({
             'assembly': 'GRCh38', 'lists': [dict(identity(override), sha256=sha256(override))],
-            'panel_sha256': sha256(self.root / 'panel.tsv')}))
+            'panel': identity(self.root / 'panel.tsv'), 'panel_sha256': sha256(self.root / 'panel.tsv')}))
         (self.root / 'metadata/rsids.txt').unlink()
         self.invoke('--check-only', '--rsids', str(override)).assert_not_called()
 
@@ -137,14 +138,55 @@ class SubmissionTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
                 pipeline.chromosomes(value)
 
-    def test_download_checksum_failure_does_not_publish(self):
+    def test_download_defers_checksum_scan_to_compute(self):
         destination = self.root / 'dbsnp.gz'
-        partial = self.root / 'dbsnp.gz.part'
-        partial.write_bytes(b'not the expected VCF')
+        (self.root / 'dbsnp.gz.part').write_bytes(b'not the expected VCF')
         with patch('urllib.request.urlopen', return_value=io.BytesIO(b'0' * 32)), patch.object(pipeline, 'command'):
-            with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
-                pipeline.download_dbsnp('https://example.org/dbsnp.gz', destination)
-        self.assertFalse(destination.exists())
+            pipeline.download_dbsnp('https://example.org/dbsnp.gz', destination)
+        self.assertTrue(destination.is_file())
+        self.assertTrue(Path(str(destination) + '.md5').is_file())
+        with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
+            verify_dbsnp(destination)
+
+    def test_missing_panel_submits_only_preparation_then_exits(self):
+        (self.root / 'panel.tsv').unlink()
+        vcf = self.write('dbsnp.vcf', 'local reference')
+        with patch('prepare_panel.read_rsids', side_effect=AssertionError('Heavy rsID loading on login')):
+            calls = self.invoke('--dbsnp-vcf', str(vcf))
+        calls.assert_called_once()
+        args = calls.call_args.args
+        self.assertEqual(args[:2], ('sbatch', '--parsable'))
+        self.assertEqual(Path(args[2]).name, 'prepare_panel.sbatch')
+        self.assertEqual(args[3:5], (vcf, self.root / 'panel.tsv'))
+        report = json.loads((self.root / 'logs/preflight.json').read_text())
+        self.assertEqual((report['status'], report['job_id']), ('awaiting_panel', '12345'))
+
+    def test_prepare_only_can_submit_panel_job(self):
+        (self.root / 'panel.tsv').unlink()
+        vcf = self.write('dbsnp.vcf', 'local reference')
+        calls = self.invoke('--prepare-only', '--dbsnp-vcf', str(vcf))
+        calls.assert_called_once()
+        self.assertEqual(Path(calls.call_args.args[2]).name, 'prepare_panel.sbatch')
+
+    def test_active_panel_job_is_not_submitted_again(self):
+        (self.root / 'panel.tsv').unlink()
+        vcf = self.write('dbsnp.vcf', 'local reference')
+        self.invoke('--dbsnp-vcf', str(vcf))
+        with patch.object(pipeline, 'panel_job_active', return_value=True):
+            self.invoke('--dbsnp-vcf', str(vcf)).assert_not_called()
+
+    def test_completed_or_failed_panel_job_can_be_retried(self):
+        (self.root / 'panel.tsv').unlink()
+        vcf = self.write('dbsnp.vcf', 'local reference')
+        self.invoke('--dbsnp-vcf', str(vcf))
+        with patch.object(pipeline, 'panel_job_active', return_value=False):
+            self.invoke('--dbsnp-vcf', str(vcf)).assert_called_once()
+
+    def test_check_only_never_submits_missing_panel(self):
+        (self.root / 'panel.tsv').unlink()
+        with self.assertRaisesRegex(ValueError, 'missing or stale'):
+            self.invoke('--check-only')
+        self.commands.assert_not_called()
 
 
 if __name__ == '__main__':

@@ -11,13 +11,8 @@ if [[ "${1:-}" == "--config" ]]; then
   config=${2:?Supply a configuration file after --config}
   shift 2
 fi
-vcf=${1:?Usage: bash scripts/prepare_references.sh [--config pipeline.json] GRCh38.vcf.gz panel1 [panel2 ...]}
+vcf=${1:?Usage: bash scripts/prepare_references.sh [--config pipeline.json] GRCh38.vcf.gz [panel1 ...]}
 shift
-[[ $# -gt 0 ]] || { echo "Supply at least one rsID panel" >&2; exit 1; }
-[[ -f "$vcf" ]] || { echo "Download the GRCh38 dbSNP VCF on the login node first: $vcf" >&2; exit 1; }
-# Use the same Python module for venv creation and execution.
-module load "${PYTHON_MODULE:-python/3.13}"
-# Small downloads first; the local dbSNP scan can take considerably longer.
-env/ld/bin/python scripts/prepare_genetic_map.py
-env/ld/bin/python scripts/prepare_blocks.py --config "$config"
-env/ld/bin/python scripts/prepare_panel.py --assembly GRCh38 --dbsnp-vcf "$vcf" --rsids "$@"
+args=(--config "$config" --prepare-only --dbsnp-vcf "$vcf")
+if [[ $# -gt 0 ]]; then args+=(--rsids "$@"); fi
+exec bash scripts/run_pipeline.sh "${args[@]}"
