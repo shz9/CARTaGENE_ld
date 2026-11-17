@@ -8,22 +8,22 @@ handle CARTaGENE's approximately 455 million input variants and 30,000 participa
 
 ## Run from one entry point
 
-On the **login node**, supply the ancestry metadata and rsID lists, then run:
+The repository includes the SNP list at `metadata/rsids.txt`, configured by the
+`rsids` field in `config/pipeline.json`. On the **login node**, supply the ancestry
+metadata, then run:
 
 ```bash
 # Pilot: prepare/check dependencies and inputs, then submit chromosome 22.
-bash scripts/run_pipeline.sh --chromosomes 22 \
-  --rsids data/panels/hm3.rsids data/panels/prs.rsids
+bash scripts/run_pipeline.sh --chromosomes 22
 
-# Once the prepared panel is available, the source lists/VCF are optional.
+# Production: reuse the prepared panel when its source list is unchanged.
 bash scripts/run_pipeline.sh --chromosomes 1-22 --max-concurrent 4
 
 # Validate existing dependencies and inputs without downloading or submitting.
 bash scripts/run_pipeline.sh --chromosomes 22 --check-only
 
 # Prepare and validate everything, stopping before submission.
-bash scripts/run_pipeline.sh --chromosomes 22 --prepare-only \
-  --rsids data/panels/hm3.rsids data/panels/prs.rsids
+bash scripts/run_pipeline.sh --chromosomes 22 --prepare-only
 ```
 
 This entry point loads the Python/PLINK modules, creates or repairs the Python
@@ -43,13 +43,18 @@ and the submitted job ID. Jobs receive a snapshot of the validated configuration
 `submit.sh` remains an alias for this workflow; direct `sbatch` is an advanced
 path that bypasses the login-node checks.
 
-When the panel needs building, `--rsids` is required. The default dbSNP location is
+The default rsID source is `metadata/rsids.txt`; no `--rsids` argument is needed.
+Change the `rsids` list in the configuration or pass `--rsids FILE [FILE...]` to
+override it. The source list is checked against the panel receipt on each run;
+changes trigger a panel rebuild (or a stale-panel error in `--check-only` mode).
+Set `rsids` to `[]` only when supplying an independently prepared panel without
+source lists. The default dbSNP location is
 `data/reference/GCF_000001405.40.gz`. If absent, the script downloads it on the
 login node with resume support and verifies the source's accompanying MD5 before
 use. Set `--dbsnp-vcf /path/to/existing/GRCh38.vcf.gz` to reuse a verified local copy,
 or `--dbsnp-url URL` to choose a GRCh38 release (with an accompanying `URL.md5`).
 Existing local VCFs are assumed to have been verified by you. A supplied panel is
-validated without requiring the full VCF; when source lists are supplied, their
+validated without requiring the full VCF; when source lists are configured or supplied, their
 hashes, the panel receipt, and available VCF metadata determine whether to rebuild.
 
 Genotype checks inspect readability, PGEN magic bytes, PVAR headers/first records,
@@ -165,8 +170,9 @@ Do not use `sbatch` for these steps. The preparation entry points reject invocat
 inside a SLURM job. There is no download fallback in the chromosome jobs: missing
 local references cause an early failure with preparation instructions.
 
-Put your panel lists at e.g. `data/panels/hm3.rsids` and `data/panels/prs.rsids`,
-one rsID per line, no header (blank lines and # comments allowed). Obtain a GRCh38
+The bundled `metadata/rsids.txt` contains one rsID per line, without a header
+(blank lines and # comments are allowed). Additional lists can be selected through
+`rsids` in the configuration or `--rsids`. Obtain a GRCh38
 dbSNP VCF from [NCBI](https://ftp.ncbi.nlm.nih.gov/snp/latest_release/VCF/) on the
 login node, record its release/checksum, and verify the assembly. This is a large
 download; reuse the verified HGDP+1KG copy if available. For example, on the login node:
@@ -178,7 +184,7 @@ curl --fail --location --continue-at - \
   https://ftp.ncbi.nlm.nih.gov/snp/latest_release/VCF/GCF_000001405.40.gz
 # Verify the downloaded release against NCBI's accompanying checksum before use.
 bash scripts/prepare_references.sh data/reference/GCF_000001405.40.gz \
-  data/panels/hm3.rsids data/panels/prs.rsids
+  metadata/rsids.txt
 ```
 
 The login-node script downloads and normalizes the Beagle GRCh38 genetic map and

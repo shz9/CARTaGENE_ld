@@ -12,7 +12,7 @@ Usage: bash scripts/run_pipeline.sh [options]
   --config FILE          Pipeline configuration (default: config/pipeline.json)
   --chromosomes LIST     Autosomes, e.g. 22 or 1-3,22 (default: 1-22)
   --max-concurrent N     Maximum simultaneous chromosome jobs (default: 4)
-  --rsids FILE [FILE...] rsID panels, required when the prepared panel is absent/stale
+  --rsids FILE [FILE...] Override config rsids (default: metadata/rsids.txt)
   --dbsnp-vcf FILE       Local GRCh38 VCF (default: data/reference/GCF_000001405.40.gz)
   --dbsnp-url URL        Download URL if the VCF is missing; fetches URL.md5 as well
   --check-only          Validate existing inputs; no installation/download/submission

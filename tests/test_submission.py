@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import run_pipeline as pipeline
 import run_chromosome
 from prepare_blocks import RAW
-from prepare_panel import sha256
+from prepare_panel import identity, sha256
 
 
 class SubmissionTests(unittest.TestCase):
@@ -38,6 +38,10 @@ class SubmissionTests(unittest.TestCase):
         self.write('chr22.pvar', '#CHROM POS ID REF ALT\n22 100 chr22:100:A:G A G\n')
         self.write('panel.tsv', 'CHROM\tPOS\tREF\tALT\tRSID\n22\t100\tA\tG\trs1\n22\t200\tC\tT\trs2\n')
         self.write('map22.tsv', 'position\tcm\n10\t0\n300\t1\n')
+        ids = self.write('metadata/rsids.txt', 'rs1\nrs2\n')
+        self.write('panel.json', json.dumps({
+            'assembly': 'GRCh38', 'lists': [dict(identity(ids), sha256=sha256(ids))],
+            'panel_sha256': sha256(self.root / 'panel.tsv')}))
         blocks = self.write('data/blocks/EUR.bed', 'chr\tstart\tstop\n' + ''.join(f'{c}\t1\t1000\n' for c in range(1, 23)))
         self.write('data/blocks/summary.json', json.dumps({'ancestries': {'EUR': {
             'source_ancestry': 'EUR', 'url': RAW + 'pyrho_EUR_LD_blocks.bed', 'sha256': sha256(blocks)}}}))
@@ -102,8 +106,23 @@ class SubmissionTests(unittest.TestCase):
 
     def test_missing_panel_requests_lists_without_downloading(self):
         (self.root / 'panel.tsv').unlink()
+        self.cfg['rsids'] = []
         with self.assertRaisesRegex(ValueError, 'Supply --rsids'):
             self.invoke()
+
+    def test_configured_list_changes_invalidate_panel(self):
+        (self.root / 'metadata/rsids.txt').write_text('rs1\nrs3\n')
+        with self.assertRaisesRegex(ValueError, 'missing or stale'):
+            self.invoke('--check-only')
+        self.commands.assert_not_called()
+
+    def test_explicit_rsids_override_configured_list(self):
+        override = self.write('alternate.txt', 'rs1\nrs2\n')
+        self.write('panel.json', json.dumps({
+            'assembly': 'GRCh38', 'lists': [dict(identity(override), sha256=sha256(override))],
+            'panel_sha256': sha256(self.root / 'panel.tsv')}))
+        (self.root / 'metadata/rsids.txt').unlink()
+        self.invoke('--check-only', '--rsids', str(override)).assert_not_called()
 
     def test_gzipped_pvar_header(self):
         pvar = self.root / 'chr22.pvar'

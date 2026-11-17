@@ -1,6 +1,9 @@
 {
   "input_prefix": "$HOME/links/projects/def-sgravel/cartagene/flagship_array_imputed_w_cag_and_topmed_r3/PGEN/chr{chrom}.imputed_metaminimac_w_CaG_TOPMed_r3",
   "metadata": "data/metadata/ancestry_labels.tsv",
+  "rsids": [
+    "metadata/rsids.txt"
+  ],
   "panel": "data/reference/panel.grch38.tsv",
   "genetic_map": "data/genetic_map/chr_{chrom}.tsv",
   "ancestries": [
@@ -16,8 +19,8 @@
   "output_dir": "results",
   "maf": 0.001,
   "mac": 20,
-  "geno": 0.02,
-  "mind": 0.02,
+  "geno": 0.05,
+  "mind": 0.05,
   "hwe": 1e-06,
   "hard_call_threshold": 0.1,
   "info_field": null,

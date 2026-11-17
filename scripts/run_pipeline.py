@@ -209,7 +209,7 @@ def download_dbsnp(url, destination):
 
 def prepare_references(cfg, chroms, args):
     panel, vcf = path(cfg["panel"]), path(args.dbsnp_vcf)
-    rsids = [path(p) for p in (args.rsids or [])]
+    rsids = [path(p) for p in (args.rsids if args.rsids is not None else cfg["rsids"])]
     for filename in rsids:
         nonempty(filename)
     if not panel_current(panel, rsids, vcf):
@@ -304,7 +304,7 @@ def main():
     parser.add_argument("--config", default="config/pipeline.json")
     parser.add_argument("--chromosomes", type=chromosomes, default=chromosomes("1-22"))
     parser.add_argument("--max-concurrent", type=int, default=4)
-    parser.add_argument("--rsids", nargs="+")
+    parser.add_argument("--rsids", nargs="+", help="Override config rsids (default: metadata/rsids.txt)")
     parser.add_argument("--dbsnp-vcf", default="data/reference/GCF_000001405.40.gz")
     parser.add_argument("--dbsnp-url", default=DEFAULT_DBSNP_URL)
     mode = parser.add_mutually_exclusive_group()

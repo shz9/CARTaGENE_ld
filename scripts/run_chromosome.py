@@ -61,6 +61,8 @@ def read_config(filename):
 
 
 def validate_config(cfg):
+    if not isinstance(cfg['rsids'], list) or any(not isinstance(p, str) or not p for p in cfg['rsids']):
+        raise ValueError('rsids must be a list of input file paths')
     groups = cfg['ancestries']
     if not groups or len(set(groups)) != len(groups) or not set(groups) <= GROUPS:
         raise ValueError('Invalid ancestries')
