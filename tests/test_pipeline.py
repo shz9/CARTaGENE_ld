@@ -32,7 +32,7 @@ class PipelineTests(unittest.TestCase):
         self.assertIsNone(chromosome('NC_000023.11'))
         self.assertIsNone(chromosome('chr1_random'))
 
-    def test_rsid_resolution_excludes_indels_multiallelic_and_ambiguity(self):
+    def test_rsid_resolution_keeps_indels_excludes_multiallelic_and_ambiguity(self):
         vcf = self.write('db.vcf', '##reference=GRCh38\n#CHROM\tPOS\tID\tREF\tALT\n'
             'NC_000001.11\t10\trs1\tA\tG\n'
             'NC_000001.11\t20\trs2\tC\tT\n'
@@ -41,8 +41,33 @@ class PipelineTests(unittest.TestCase):
             'NC_000001.11\t50\trs5\tA\tAC\n'
             'NC_000001.11\t60\trs6\tA\tC,G\n')
         result, stats = resolve_panel(vcf, {f'rs{i}' for i in range(1, 8)})
-        self.assertEqual(result, [((1, 10, 'A', 'G'), 'rs1')])
-        self.assertEqual(stats['unresolved_or_excluded'], 6)
+        self.assertEqual(result, [((1, 10, 'A', 'G'), 'rs1'), ((1, 50, 'A', 'AC'), 'rs5')])
+        self.assertEqual(stats['unresolved_or_excluded'], 5)
+        self.assertEqual(stats['resolved_by_type'], {'snp': 1, 'indel': 1})
+        self.assertEqual(stats['excluded_records'], {'multiallelic': 1})
+        self.assertEqual(stats['rsid_outcomes'], {'resolved': 2, 'not_found': 1,
+            'no_eligible_record': 1, 'ambiguous_mapping': 1, 'alias_conflict': 2})
+
+    def test_indels_survive_resolution_panel_loading_matching_and_annotation(self):
+        vcf = self.write('indels.vcf', '#CHROM\tPOS\tID\tREF\tALT\n'
+            '1\t10\trs1\tA\tAC\n1\t20\trs2\tAT\tA\n1\t30\trs3\tAC\tGT\n'
+            '1\t40\trs4\tA\t<DEL>\n1\t50\trs5\tA\t*\n1\t60\trs6\tA\tC,AT\n')
+        rows, stats = resolve_panel(vcf, {f'rs{i}' for i in range(1, 8)})
+        self.assertEqual(stats['resolved_by_type'], {'indel': 2, 'mnv': 1})
+        self.assertEqual(stats['excluded_records'], {'invalid_or_symbolic_alleles': 2, 'multiallelic': 1})
+        panel_file = self.write('panel.tsv', 'CHROM\tPOS\tREF\tALT\tRSID\n' +
+            ''.join(f'{c}\t{pos}\t{ref}\t{alt}\t{rsid}\n' for (c, pos, ref, alt), rsid in rows))
+        panel = load_panel(panel_file, 1)
+        pvar = self.write('chr1.pvar', '#CHROM POS ID REF ALT\n1 10 ins A AC\n'
+            '1 20 del AT A\n1 21 shifted AT A\n1 30 mnv AC GT\n1 60 multi A C,AT\n')
+        mapping, _ = match_pvar(pvar, panel, 1)
+        self.assertEqual(set(mapping), {'ins', 'del', 'mnv'})
+        genetic_map = self.write('map.tsv', 'position\tcm\n10\t1\n30\t3\n')
+        bim = self.write('test.bim', '1 ins 0 10 AC A\n1 del 0 20 A AT\n1 mnv 0 30 GT AC\n')
+        annotate(bim, genetic_map, mapping)
+        result = [line.split() for line in bim.read_text().splitlines()]
+        self.assertEqual([r[1] for r in result], ['rs1', 'rs2', 'rs3'])
+        self.assertEqual([r[4:] for r in result], [['AC', 'A'], ['A', 'AT'], ['GT', 'AC']])
 
     def test_pvar_exact_alleles_and_quality(self):
         pvar = self.write('chr1.pvar', '##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tINFO\n'

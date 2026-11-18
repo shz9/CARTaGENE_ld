@@ -17,7 +17,7 @@ import zipfile
 import pandas as pd
 
 from annotate_bim import annotate, read_bim, variant_table
-from prepare_panel import chromosome, identity, sha256, RSID
+from prepare_panel import chromosome, identity, sha256, RSID, DNA
 from ld_blocks import parse_blocks
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -133,7 +133,7 @@ def load_panel(filename, chrom):
         table = pd.concat([chunk.loc[chunk.CHROM.eq(chrom)] for chunk in chunks], ignore_index=True)
     if table.empty:
         raise ValueError(f'No panel variants on chromosome {chrom}')
-    valid = (table.POS.gt(0) & table.REF.isin(list('ACGT')) & table.ALT.isin(list('ACGT'))
+    valid = (table.POS.gt(0) & table.REF.str.fullmatch(DNA.pattern) & table.ALT.str.fullmatch(DNA.pattern)
              & table.REF.ne(table.ALT) & table.RSID.str.fullmatch(RSID.pattern))
     if not valid.all():
         raise ValueError('Invalid panel row')
@@ -336,7 +336,7 @@ def run(args):
             shared = work / 'shared'
             command([*base, '--pgen', pgen, '--pvar', pvar, '--psam', psam,
                      '--chr', args.chrom, '--keep', work / 'all.keep', '--extract', work / 'extract.txt',
-                     '--snps-only', 'just-acgt', '--min-alleles', 2, '--max-alleles', 2,
+                     '--min-alleles', 2, '--max-alleles', 2,
                      '--hard-call-threshold', cfg['hard_call_threshold'], '--make-bed', '--out', shared])
             summary['shared_variants'] = line_count(work / 'shared.bim')
             summary['shared_samples'] = line_count(work / 'shared.fam')

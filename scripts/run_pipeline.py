@@ -3,6 +3,7 @@
 
 import argparse
 import gzip
+import getpass
 import hashlib
 import json
 import os
@@ -19,7 +20,7 @@ from annotate_bim import load_genetic_map
 from magenpy import __version__ as magenpy_version
 from magenpy.stats.ld import c_utils  # Verify the compiled native LD extension imports.
 from prepare_blocks import prepare as prepare_blocks
-from prepare_panel import chromosome, identity, sha256
+from prepare_panel import chromosome, identity, sha256, PANEL_POLICY
 from run_chromosome import (
     ROOT,
     load_keep,
@@ -169,15 +170,17 @@ def panel_current(panel, rsids, vcf):
     recorded = [{k: row.get(k) for k in ('path', 'size', 'mtime_ns')}
                 for row in report.get('lists', [])]
     return (report.get('assembly') == 'GRCh38'
+            and report.get('variant_policy') == PANEL_POLICY
             and recorded == [identity(p) for p in rsids]
             and report.get('panel') == identity(panel)
             and (not vcf.exists() or report.get('dbsnp') == identity(vcf)))
 
 
 def panel_job_active(job_id):
-    queued = subprocess.run(['squeue', '--noheader', '--jobs', job_id, '--format=%T'],
+    # Query active jobs for this user so a purged/completed job ID is simply absent.
+    queued = subprocess.run(['squeue', '--noheader', '--user', getpass.getuser(), '--format=%A'],
                             text=True, capture_output=True, check=True)
-    return bool(queued.stdout.strip())
+    return job_id in queued.stdout.split()
 
 
 def submit_panel(panel, rsids, vcf):

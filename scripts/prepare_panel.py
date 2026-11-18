@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stream GRCh38 dbSNP once, retaining unambiguous requested biallelic SNPs."""
+"""Stream GRCh38 dbSNP once, retaining unambiguous requested biallelic sequence variants."""
 import argparse
 from collections import Counter
 import gzip
@@ -13,6 +13,8 @@ import pandas as pd
 
 COLUMNS = ['CHROM', 'POS', 'REF', 'ALT', 'RSID']
 RSID = re.compile(r'rs[0-9]+')
+DNA = re.compile(r'[ACGT]+')
+PANEL_POLICY = 'biallelic-sequence-v1'
 
 
 def chromosome(value):
@@ -36,6 +38,8 @@ def identity(path):
 def resolve_panel(vcf, wanted):
     matches = {}
     ambiguous = set()
+    seen = set()
+    excluded_records = Counter()
     opener = gzip.open if str(vcf).endswith(('.gz', '.bgz')) else open
     counts = Counter()
     with opener(vcf, 'rt') as handle:
@@ -49,11 +53,20 @@ def resolve_panel(vcf, wanted):
             if not ids:
                 continue
             counts['requested_records'] += 1
+            seen.update(ids)
             chrom = chromosome(f[0])
             ref, alt = f[3].upper(), f[4].upper()
-            # A multiallelic record is excluded, even if one ALT is a SNP.
-            if chrom is None or ref not in 'ACGT' or alt not in 'ACGT' or len(ref) != 1 or len(alt) != 1 or ref == alt:
+            # Keep explicit DNA sequences (including indels); never split multiallelics.
+            if chrom is None:
+                excluded_records['non_autosomal'] += 1
                 continue
+            if ',' in alt:
+                excluded_records['multiallelic'] += 1
+                continue
+            if not DNA.fullmatch(ref) or not DNA.fullmatch(alt) or ref == alt:
+                excluded_records['invalid_or_symbolic_alleles'] += 1
+                continue
+            counts['eligible_records'] += 1
             key = (chrom, int(f[1]), ref, alt)
             if key[1] < 1:
                 raise ValueError('Invalid VCF position')
@@ -68,6 +81,16 @@ def resolve_panel(vcf, wanted):
     counts.update(requested=len(wanted), resolved=len(result),
                   ambiguous_rsids=len(ambiguous),
                   unresolved_or_excluded=len(wanted) - len(result))
+    counts['rsid_outcomes'] = {
+        'resolved': len(result), 'not_found': len(wanted - seen),
+        'no_eligible_record': len(seen - matches.keys()),
+        'ambiguous_mapping': len(ambiguous),
+        'alias_conflict': sum(loci[key] > 1 for rsid, key in matches.items() if rsid not in ambiguous),
+    }
+    counts['excluded_records'] = dict(excluded_records)
+    counts['resolved_by_type'] = dict(Counter(
+        'snp' if len(key[2]) == len(key[3]) == 1 else
+        'indel' if len(key[2]) != len(key[3]) else 'mnv' for key, _ in result))
     return sorted(result), dict(counts)
 
 
@@ -123,7 +146,7 @@ def main():
     pd.DataFrame.from_records([(*key, rsid) for key, rsid in rows], columns=COLUMNS).to_csv(
         temporary, sep='\t', index=False)
     temporary.replace(args.output)
-    summary.update(assembly=args.assembly, dbsnp=identity(args.dbsnp_vcf),
+    summary.update(assembly=args.assembly, variant_policy=PANEL_POLICY, dbsnp=identity(args.dbsnp_vcf),
                    lists=[dict(identity(p), sha256=sha256(p)) for p in args.rsids],
                    panel=identity(args.output), panel_sha256=sha256(args.output),
                    chromosomes=dict(Counter(key[0] for key, _ in rows)))

@@ -21,7 +21,9 @@ class NativeLDTest(unittest.TestCase):
             root = Path(tmp)
             prefix = root / 'test'
             prefix.with_suffix('.fam').write_text(''.join(f'{i} {i} 0 0 0 -9\n' for i in range(40)))
-            prefix.with_suffix('.bim').write_text(''.join(f'22 rs{j+1} {j/100} {100+j} A G\n' for j in range(6)))
+            alleles = [('AC', 'A'), ('A', 'AT'), ('A', 'G'), ('C', 'T'), ('AC', 'GT'), ('G', 'C')]
+            prefix.with_suffix('.bim').write_text(''.join(
+                f'22 rs{j+1} {j/100} {100+j} {a1} {a2}\n' for j, (a1, a2) in enumerate(alleles)))
             # Variant-major PLINK BED: 00=two A1, 10=one A1, 11=zero A1.
             encoding = {0: 3, 1: 2, 2: 0}
             with prefix.with_suffix('.bed').open('wb') as handle:
@@ -49,6 +51,7 @@ class NativeLDTest(unittest.TestCase):
                         expected[:nleft, nleft:] = 0
                         expected[nleft:, :nleft] = 0
                     np.testing.assert_allclose(observed, expected, atol=0.008 if dtype == 'int8' else 0.0001)
+                    self.assertEqual(list(zip(ld.a1, ld.a2)), alleles)
                     self.assertEqual(str(ld.stored_dtype), dtype)
                     self.assertEqual(ld.get_store_attr('Ancestry'), group)
                     self.assertEqual(list(output.iterdir()), [archive])

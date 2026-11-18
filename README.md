@@ -104,10 +104,20 @@ against their provenance manifest before submission.
 2. Stream a GRCh38 dbSNP VCF once to resolve **only requested rsIDs** into a compact
    allele-aware panel. Match chromosome, position, REF, and ALT exactly against PVAR;
    never map by position alone, strand-flip, or use GRCh37 coordinates. Keep only
-   biallelic A/C/G/T SNPs. Reject ambiguous rsID/locus mappings and duplicate source
-   records. Indels such as `chr10:10370:A:AC` are intentionally excluded in this
-   initial SNP-panel implementation. rsID aliases absent from the supplied dbSNP
+   biallelic variants with distinct, nonempty A/C/G/T sequence alleles, including
+   insertions/deletions such as `chr10:10370:A:AC` and multi-base substitutions.
+   Symbolic/missing alleles and multiallelic records remain excluded. There is no
+   arbitrary sequence-length cutoff. Reject ambiguous rsID/locus mappings and
+   duplicate source records. rsID aliases absent from the supplied dbSNP
    release are reported as unresolved; reconcile merged IDs upstream if needed.
+   Matching remains exact: differently padded/left-aligned indels are not
+   automatically normalized or matched by position alone. Both sources must use
+   the same GRCh38 representation. No reference genome is downloaded for normalization.
+   Panel receipts record `variant_policy`; old SNP-only panels automatically trigger
+   a SLURM rebuild, after which the launcher exits and asks you to wait and rerun.
+   Independently supplied panels (`rsids: []`) remain under the user's control.
+   The new summary distinguishes `rsid_outcomes` (disjoint unique-ID counts),
+   `excluded_records` (VCF-row counts), and `resolved_by_type` (SNP/indel/MNV).
 3. Validate ancestry metadata and intersect FID/IID pairs with each chromosome's
    PSAM. Write ancestry keep files and report unmatched labels. Optional sample QC
    keep files can restrict to an independently selected unrelated, high-quality
@@ -120,14 +130,19 @@ against their provenance manifest before submission.
    preserve dosages. Re-read BED before missingness/frequency QC so those statistics
    describe exactly the hardcalls used for LD. This threshold is dosage distance,
    **not** a posterior genotype probability threshold.
-6. Within each ancestry: sample missingness <= 0.02 on the panel, followed by variant
-   missingness <= 0.02, MAF >= 0.001, MAC >= 20, and HWE p >= 1e-6 with `midp
+6. Within each ancestry: sample missingness <= 0.05 on the panel, followed by variant
+   missingness <= 0.05, MAF >= 0.001, MAC >= 20, and HWE p >= 1e-6 with `midp
    keep-fewhet`. `keep-fewhet` targets excess heterozygosity and reduces rejection
    from residual structure; review diagnostics for admixed groups. Do not apply
    pooled HWE or pooled MAF, which could lose variants common in minority groups.
    MAC 20 gives an effective minimum MAF near 20/(2N), often stricter than 0.1%
    for small groups. Boundaries are inclusive. Defaults are starting points to
    assess on chr22, not a guarantee of LD precision or panel size.
+   MAC 10 can be evaluated by setting `mac` to `10`. Pearson correlations remain
+   computable, but ten minor copies may be carried by only 5–10 people; rare–rare
+   correlations can be sensitive to individual carriers and genotype errors.
+   This is an exploratory retention/precision trade-off, not a universal accuracy
+   guarantee. MAC remains 20 by default; MAF >= 0.001 still applies independently.
 7. Optional imputation R2 filtering (suggested starting threshold 0.8) requires an
    explicitly named scalar PVAR INFO field. Missing/nonfinite values fail when
    enabled. No field name or quality availability is assumed; by default no

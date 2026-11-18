@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import run_pipeline as pipeline
 import run_chromosome
 from prepare_blocks import RAW
-from prepare_panel import identity, sha256, verify_dbsnp
+from prepare_panel import identity, sha256, verify_dbsnp, PANEL_POLICY
 
 
 class SubmissionTests(unittest.TestCase):
@@ -41,7 +41,7 @@ class SubmissionTests(unittest.TestCase):
         self.write('map22.tsv', 'position\tcm\n10\t0\n300\t1\n')
         ids = self.write('metadata/rsids.txt', 'rs1\nrs2\n')
         self.write('panel.json', json.dumps({
-            'assembly': 'GRCh38', 'lists': [dict(identity(ids), sha256=sha256(ids))],
+            'assembly': 'GRCh38', 'variant_policy': PANEL_POLICY, 'lists': [dict(identity(ids), sha256=sha256(ids))],
             'panel': identity(self.root / 'panel.tsv'), 'panel_sha256': sha256(self.root / 'panel.tsv')}))
         blocks = self.write('data/blocks/EUR.bed', 'chr\tstart\tstop\n' + ''.join(f'{c}\t1\t1000\n' for c in range(1, 23)))
         self.write('data/blocks/summary.json', json.dumps({'ancestries': {'EUR': {
@@ -120,7 +120,7 @@ class SubmissionTests(unittest.TestCase):
     def test_explicit_rsids_override_configured_list(self):
         override = self.write('alternate.txt', 'rs1\nrs2\n')
         self.write('panel.json', json.dumps({
-            'assembly': 'GRCh38', 'lists': [dict(identity(override), sha256=sha256(override))],
+            'assembly': 'GRCh38', 'variant_policy': PANEL_POLICY, 'lists': [dict(identity(override), sha256=sha256(override))],
             'panel': identity(self.root / 'panel.tsv'), 'panel_sha256': sha256(self.root / 'panel.tsv')}))
         (self.root / 'metadata/rsids.txt').unlink()
         self.invoke('--check-only', '--rsids', str(override)).assert_not_called()
@@ -181,6 +181,21 @@ class SubmissionTests(unittest.TestCase):
         self.invoke('--dbsnp-vcf', str(vcf))
         with patch.object(pipeline, 'panel_job_active', return_value=False):
             self.invoke('--dbsnp-vcf', str(vcf)).assert_called_once()
+
+    def test_panel_job_status_handles_completed_ids(self):
+        with patch('run_pipeline.subprocess.run', return_value=subprocess.CompletedProcess([], 0, stdout='54321\n')):
+            self.assertFalse(pipeline.panel_job_active('12345'))
+            self.assertTrue(pipeline.panel_job_active('54321'))
+
+    def test_old_snp_only_panel_schedules_rebuild(self):
+        receipt = self.root / 'panel.json'
+        report = json.loads(receipt.read_text())
+        report.pop('variant_policy')
+        receipt.write_text(json.dumps(report))
+        vcf = self.write('dbsnp.vcf', 'local reference')
+        calls = self.invoke('--dbsnp-vcf', str(vcf))
+        calls.assert_called_once()
+        self.assertEqual(Path(calls.call_args.args[2]).name, 'prepare_panel.sbatch')
 
     def test_check_only_never_submits_missing_panel(self):
         (self.root / 'panel.tsv').unlink()
