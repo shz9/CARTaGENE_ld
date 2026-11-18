@@ -20,6 +20,7 @@ from annotate_bim import load_genetic_map
 from magenpy import __version__ as magenpy_version
 from magenpy.stats.ld import c_utils  # Verify the compiled native LD extension imports.
 from prepare_blocks import prepare as prepare_blocks
+from migrate_outputs import migrate
 from prepare_panel import chromosome, identity, sha256, PANEL_POLICY
 from run_chromosome import (
     ROOT,
@@ -27,6 +28,7 @@ from run_chromosome import (
     local_references,
     path,
     read_config,
+    reusable_results,
     sample_ids,
     samples,
     validate_config,
@@ -329,6 +331,7 @@ def main():
     parser.add_argument("--dbsnp-url", default=DEFAULT_DBSNP_URL)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check-only", action="store_true")
+    mode.add_argument("--organize-only", action="store_true", help="Reorganize legacy outputs and exit without submitting jobs")
     mode.add_argument("--prepare-only", action="store_true", help="Prepare references (may submit a panel job); do not submit LD jobs")
     args = parser.parse_args()
     if args.max_concurrent < 1:
@@ -337,6 +340,11 @@ def main():
     config_file = path(args.config).resolve()
     cfg = read_config(config_file)
     validate_config(cfg)
+    if not args.check_only:
+        migrate(path(cfg['output_dir']), path(cfg['work_dir']) / 'legacy')
+    if args.organize_only:
+        print('Output reorganization complete. No jobs submitted.', flush=True)
+        return
     if magenpy_version != "0.2.5":
         raise ValueError("Expected magenpy 0.2.5")
     plink = shutil.which("plink2") or shutil.which("plink")
@@ -350,10 +358,17 @@ def main():
     if not prepare_references(cfg, args.chromosomes, args):
         return
     writable_directory(path(cfg["output_dir"]))
+    writable_directory(path(cfg["work_dir"]))
     writable_directory(ROOT / "logs")
     if cfg["scratch_dir"]:
         writable_directory(path(cfg["scratch_dir"]))
+    completed = reusable_results(cfg, args.chromosomes)
+    remaining = [c for c in args.chromosomes if c not in completed]
+    if completed:
+        print(f'Keeping completed chromosomes: {sorted(completed)}', flush=True)
     report = {
+        "completed_chromosomes": sorted(completed),
+        "remaining_chromosomes": remaining,
         "config": cfg,
         "chromosomes": args.chromosomes,
         "genotypes": genotypes,
@@ -365,13 +380,13 @@ def main():
     receipt = ROOT / "logs/preflight.json"
     receipt.write_text(json.dumps(report, indent=2) + "\n")
     print(f"All requested chromosomes validated. Report: {receipt}", flush=True)
-    if not args.prepare_only and not args.check_only:
+    if not args.prepare_only and not args.check_only and remaining:
         # Freeze the validated settings rather than rereading a mutable config on workers.
         settings = json.dumps(cfg, indent=2) + "\n"
         token = hashlib.sha256(settings.encode()).hexdigest()[:16]
         snapshot = ROOT / f"logs/config-{token}.json"
         snapshot.write_text(settings)
-        array = ",".join(map(str, args.chromosomes)) + f"%{args.max_concurrent}"
+        array = ",".join(map(str, remaining)) + f"%{args.max_concurrent}"
         submitted = command(
             "sbatch",
             "--parsable",

@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import zipfile
 import unittest
 from unittest.mock import patch
 
@@ -74,6 +75,54 @@ class SubmissionTests(unittest.TestCase):
             finally:
                 os.chdir(previous)
             return calls
+
+    def legacy_result(self, chrom=22):
+        folder = self.root / ('results/' + 'a' * 20) / f'chr{chrom}'
+        archive = folder / f'EUR/ld/chr_{chrom}.zip'
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(archive, 'w') as zipped:
+            zipped.writestr('.zmetadata', '{}')
+        references = [self.root / p for p in ('metadata.tsv', 'panel.tsv', f'map{chrom}.tsv', 'data/blocks/EUR.bed')]
+        old_config = {k: v for k, v in self.cfg.items() if k != 'work_dir'}
+        summary = {'fingerprint': {'chrom': chrom, 'config': old_config,
+                   'inputs': [identity(self.root / f'chr{chrom}.{ext}') for ext in ('pgen', 'pvar', 'psam')],
+                   'references': {str(p): sha256(p) for p in references}},
+                   'ancestries': {'EUR': {'status': 'complete'}}}
+        (folder / 'summary.json').write_text(json.dumps(summary))
+        return archive
+
+    def test_launcher_migrates_and_does_not_recompute_completed_outputs(self):
+        self.legacy_result()
+        self.invoke().assert_not_called()
+        self.assertTrue((self.root / 'results/EUR/chr_22.zip').is_file())
+        self.invoke().assert_not_called()  # Recognized on subsequent runs as well.
+
+    def test_changed_analysis_settings_do_not_reuse_migrated_results(self):
+        self.legacy_result()
+        self.cfg['mac'] = 10
+        self.invoke().assert_called_once()
+
+    def test_changed_inputs_do_not_reuse_migrated_results(self):
+        self.legacy_result()
+        with (self.root / 'chr22.pgen').open('ab') as handle:
+            handle.write(b'changed')
+        self.invoke().assert_called_once()
+
+    def test_only_missing_chromosomes_are_submitted(self):
+        self.legacy_result()
+        for ext in ('psam', 'pgen', 'pvar'):
+            source = self.root / f'chr22.{ext}'
+            target = self.root / f'chr21.{ext}'
+            target.write_bytes(source.read_bytes().replace(b'22', b'21') if ext == 'pvar' else source.read_bytes())
+        self.write('map21.tsv', 'position\tcm\n10\t0\n300\t1\n')
+        calls = self.invoke('--chromosomes', '21-22')
+        self.assertIn('--array=21%4', calls.call_args.args)
+
+    def test_organize_only_migrates_without_preparation_or_submission(self):
+        self.legacy_result()
+        (self.root / 'panel.tsv').unlink()
+        self.invoke('--organize-only').assert_not_called()
+        self.assertTrue((self.root / 'results/EUR/chr_22.zip').is_file())
 
     def test_cached_inputs_submit_once_with_config_snapshot(self):
         calls = self.invoke()

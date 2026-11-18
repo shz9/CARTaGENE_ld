@@ -266,6 +266,106 @@ def compute_ld(bfile, output, temporary, cfg, chrom, group, threads):
     return ld_variants
 
 
+def reusable_results(cfg, chroms):
+    """Recognize published results without hashing large data or scanning ZIP chunks."""
+    output = path(cfg['output_dir']).resolve()
+    work = path(cfg['work_dir'])
+    if not work.is_dir():
+        return {}
+    completed, hashes = {}, {}
+    ignored = {'work_dir', 'retain_bed', 'output_dir'}
+    settings = {k: v for k, v in cfg.items() if k not in ignored}
+    for summary_file in work.rglob('summary.json'):
+        try:
+            summary = json.loads(summary_file.read_text())
+        except (OSError, ValueError):
+            continue
+        fingerprint = summary.get('fingerprint', {})
+        chrom = fingerprint.get('chrom')
+        if chrom not in chroms or chrom in completed:
+            continue
+        old = {k: v for k, v in fingerprint.get('config', {}).items() if k not in ignored}
+        if old != settings:
+            continue
+        published = summary_file.with_name('published.json')
+        if published.is_file():
+            archives = json.loads(published.read_text())
+        else:
+            current = summary_file.parent.parent / 'current.json'
+            if not current.is_file():
+                continue
+            receipt = json.loads(current.read_text())
+            if receipt.get('token') != summary_file.parent.name:
+                continue
+            archives = receipt.get('archives', {})
+        try:
+            if not fingerprint.get('inputs') or any(identity(Path(row['path'])) != row for row in fingerprint['inputs']):
+                continue
+            references = fingerprint.get('references', {})
+            if not references:
+                continue
+            valid = True
+            for filename, expected in references.items():
+                reference = Path(filename)
+                if filename not in hashes:
+                    if reference.resolve() == path(cfg['panel']).resolve():
+                        receipt = json.loads(reference.with_suffix('.json').read_text())
+                        hashes[filename] = receipt.get('panel_sha256') if receipt.get('panel') == identity(reference) else None
+                    else:
+                        hashes[filename] = sha256(reference)
+                valid &= hashes[filename] == expected
+            if not valid:
+                continue
+            for group in cfg['ancestries']:
+                stats = summary.get('ancestries', {}).get(group, {})
+                if stats.get('status') == 'skipped':
+                    continue
+                target = output / group / f'chr_{chrom}.zip'
+                if stats.get('status') != 'complete' or identity(target) != archives.get(group):
+                    valid = False
+                    break
+                with zipfile.ZipFile(target) as zipped:
+                    if '.zmetadata' not in zipped.namelist():
+                        valid = False
+                        break
+            if valid:
+                completed[chrom] = summary
+        except (OSError, ValueError, zipfile.BadZipFile):
+            continue
+    return completed
+
+
+def publish_results(work, output, metadata, chrom, token, summary, previous):
+    """Publish only LD ZIPs; keep private diagnostics and receipts in work_dir."""
+    output.mkdir(parents=True, exist_ok=True)
+    archives = {}
+    for group, stats in summary['ancestries'].items():
+        target = output / group / f'chr_{chrom}.zip'
+        if stats.get('status') == 'complete':
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_name(f'.{target.name}.partial')
+            shutil.copyfile(work / group / 'ld' / target.name, temporary)
+            temporary.replace(target)
+            archives[group] = identity(target)
+        elif target.exists() and group in previous.get('archives', {}):
+            if identity(target) != previous['archives'][group]:
+                raise ValueError(f'Refusing to remove an externally changed archive: {target}')
+            target.unlink()  # A formerly complete group is now skipped: remove its stale LD.
+    staging = metadata.parent / f'.{token}.partial'
+    if staging.exists():
+        shutil.rmtree(staging)
+    shutil.copytree(work, staging, ignore=shutil.ignore_patterns('ld'))
+    (staging / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+    (staging / 'published.json').write_text(json.dumps(archives, indent=2) + '\n')
+    if metadata.exists():
+        shutil.rmtree(metadata)
+    staging.replace(metadata)
+    receipt = metadata.parent / 'current.json'
+    temporary = receipt.with_suffix('.json.tmp')
+    temporary.write_text(json.dumps({'token': token, 'archives': archives}, indent=2) + '\n')
+    temporary.replace(receipt)
+
+
 def run(args):
     cfg = read_config(path(args.config))
     validate_config(cfg)
@@ -292,18 +392,23 @@ def run(args):
                    'code': {f.name: sha256(f) for f in sorted((ROOT / 'scripts').glob('*')) if f.is_file()}}
     import hashlib
     token = hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()[:20]
-    parent = path(cfg['output_dir']) / token
-    destination = parent / f'chr{args.chrom}'
+    output = path(cfg['output_dir']).resolve()
+    output_key = hashlib.sha256(str(output.resolve()).encode()).hexdigest()[:12]
+    parent = path(cfg['work_dir']) / output_key / f'chr_{args.chrom}'
+    destination = parent / token
     parent.mkdir(parents=True, exist_ok=True)
-    receipt = destination / 'summary.json'
-    if receipt.is_file():
-        summary = json.loads(receipt.read_text())
-        for group, stats in summary['ancestries'].items():
-            if stats.get('status') == 'complete':
-                validate_zip(destination / group / 'ld' / f'chr_{args.chrom}.zip')
-        print(f'Already complete: {destination}')
-        return
-    lock = parent / f'chr{args.chrom}.lock'
+    receipt = parent / 'current.json'
+    previous = json.loads(receipt.read_text()) if receipt.is_file() else {}
+    if previous.get('token') == token and (destination / 'summary.json').is_file():
+        intact = all((output / g / f'chr_{args.chrom}.zip').is_file()
+                     and identity(output / g / f'chr_{args.chrom}.zip') == info
+                     for g, info in previous['archives'].items())
+        if intact:
+            for group in previous['archives']:
+                validate_zip(output / group / f'chr_{args.chrom}.zip')
+            print(f'Already complete: {output} (chr{args.chrom})')
+            return
+    lock = parent / 'publish.lock'
     lock.mkdir()  # Exclusive ownership. A SIGKILL can leave this lock behind.
     try:
         scratch = cfg['scratch_dir'] or os.environ.get('SLURM_TMPDIR')
@@ -318,7 +423,11 @@ def run(args):
                 with (work / 'commands.jsonl').open('a') as handle:
                     handle.write(json.dumps(arguments) + '\n')
                 subprocess.run(arguments, check=True)
-            memory = max(512, int(os.environ.get('SLURM_MEM_PER_NODE', '131072')) * 3 // 4)
+            allocated_mb = int(os.environ.get('SLURM_MEM_PER_NODE', 0))
+            if not allocated_mb:
+                allocated_mb = (int(os.environ['SLURM_MEM_PER_CPU']) * args.threads
+                                if 'SLURM_MEM_PER_CPU' in os.environ else 16384)
+            memory = max(512, allocated_mb * 3 // 4)
             base = [args.plink, '--threads', args.threads, '--memory', memory]
             available = sample_ids(psam)
             keep = load_keep(path(cfg['sample_keep'])) if cfg['sample_keep'] else None
@@ -380,13 +489,8 @@ def run(args):
                     f.unlink()
                 elif f.parent == work and f.suffix not in ('.log', '.jsonl'):
                     f.unlink()
-            (work / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
-            staging = parent / f'.chr{args.chrom}.partial'
-            if staging.exists():
-                shutil.rmtree(staging)
-            shutil.copytree(work, staging)
-            staging.replace(destination)
-            print(f'Complete: {destination}', flush=True)
+            publish_results(work, output, destination, args.chrom, token, summary, previous)
+            print(f'Complete: {output}/{{ancestry}}/chr_{args.chrom}.zip; diagnostics: {destination}', flush=True)
     finally:
         lock.rmdir()
 

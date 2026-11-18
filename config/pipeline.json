@@ -39,5 +39,6 @@
   },
   "storage_dtype": "int8",
   "retain_bed": false,
-  "run_tag": "v1"
+  "run_tag": "v1",
+  "work_dir": "data/work"
 }

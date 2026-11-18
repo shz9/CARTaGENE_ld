@@ -51,11 +51,11 @@ inspect its log, fix the cause, and rerun; the script can resubmit preparation.
 Panel-job state is stored under `logs/panel-<output-path-hash>.json`. If SLURM
 status cannot be queried, the script fails rather than risk a duplicate job.
 
-Default panel allocation: **1 CPU, 32 GiB RAM, 5 hours**, adjustable in
+Default panel allocation: **1 CPU, 8 GiB RAM, 2 hours**, adjustable in
 `prepare_panel.sbatch`. It uses the same Python module and environment as LD jobs.
 All panel-job inputs must be on shared storage; it performs no downloads.
 Only after a completed panel is available and the lightweight checks succeed
-does a normal run submit the LD chromosome array. `--prepare-only` can submit a
+does a normal run submit LD jobs for chromosomes that are not already complete. `--prepare-only` can submit a
 panel preparation job but never LD jobs. `--check-only` never installs, downloads,
 or submits anything; a missing/stale panel fails validation. Successful checks
 write `logs/preflight.json` and check that log/output/configured scratch directories
@@ -295,11 +295,14 @@ bash scripts/run_pipeline.sh --config config/pipeline.json --chromosomes 22
 bash scripts/run_pipeline.sh --config config/pipeline.json --chromosomes 1-22 --max-concurrent 4
 ```
 
-Default allocation per chromosome: 16 CPUs, 128 GiB RAM, 48 hours; at most four
+Default allocation per chromosome: **8 CPUs, 16 GiB RAM, 5 hours**; at most four
 chromosomes concurrently in the example. These are initial requests, not measured
-requirements. chr1 is a second useful resource pilot. Use `sacct` to inspect peak
+requirements. PLINK's workspace uses 75% of the SLURM memory allocation (12 GiB
+with the default 16 GiB request), leaving room for Python and other overhead.
+chr1 is a second useful resource pilot. Use `sacct` to inspect peak
 RSS and runtime and adjust `--mem`/`--time` via `SBATCH_MEM`/`SBATCH_TIMELIMIT` or
-edit the batch directives. Large blocks/high-density regions can dominate storage
+edit the batch directives. Changes apply to new submissions; existing jobs retain
+their original allocations. Large blocks/high-density regions can dominate storage
 and compute. Shared full-panel BED is about N*M/4 bytes (roughly 19 GB genome-wide
 at 30k x 2.5M), excluding per-ancestry copies, LD and temporaries. Provision generous
 scratch; LD size depends on local density and block size (or map plateaus in window mode). Jobs require
@@ -307,37 +310,113 @@ scratch; LD size depends on local density and block size (or map plateaus in win
 
 ## Outputs and reruns
 
-Each job fingerprints configuration, scripts, reference/metadata content, input
-PGEN/PVAR/PSAM size+mtime, and tool versions. Completed results live under:
+`output_dir` defaults to `results`. Its final LD layout is:
 
 ```text
-results/<chromosome-fingerprint>/chr22/
-  summary.json
-  commands.jsonl
-  shared.*.log
-  EUR/
-    samples.keep
-    qc.bim, qc.fam, qc.log, samples.log
-    variants.tsv
-    ld/chr_22.zip
+results/
+  AFR/chr_1.zip
+  AFR/chr_2.zip
+  ...
+  EUR/chr_1.zip
+  EUR/chr_2.zip
+  ...
 ```
 
-The exact output path is printed in the job log. Summary reports panel matches,
-unmatched metadata, pre/post-QC sample/variant counts, LD variant counts, skipped groups, endpoint cM
-counts, parameters and software versions. `variants.tsv` records original ID,
-rsID, GRCh38 REF/ALT and position. Keep BIM/FAM and logs private: they contain sample
-IDs. Data, environments, logs and results are gitignored. No upload or publication
-is performed. QC BEDs are copied only when `retain_bed` is true; scratch is cleaned
-on normal exit, and the scheduler manages node-local scratch after termination.
+Only LD ZIPs are published here. Private QC files (BIM/FAM/keep files), PLINK logs,
+variant mapping tables, summaries and completion receipts are stored separately
+under `work_dir` (default `data/work`):
 
-A success receipt is written only after ZIP CRC and consolidated-metadata checks
-and atomic publication of a chromosome directory. Existing receipts with intact
-archives skip recomputation. Incomplete jobs are recomputed in fresh scratch;
-outputs for changed inputs use a new fingerprint. Large PGENs are identified by
-size/mtime rather than fully hashed; replace files with updated mtimes or change
-`run_tag` when their content changes. Do not submit duplicate chromosome tasks to
-the same output configuration concurrently. An output lock prevents collisions;
-a killed job may leave a lock requiring manual removal after confirming it is dead.
+```text
+data/work/<output-directory-id>/chr_1/
+  current.json
+  <run-fingerprint>/
+    summary.json
+    commands.jsonl
+    EUR/qc.bim
+    EUR/qc.fam
+    EUR/variants.tsv
+    ...
+```
+
+Do not upload `work_dir`: it contains sample identifiers. `retain_bed` controls
+whether QC BED files are preserved there. LD stores are packaged as consolidated
+Zarr v2 ZIPs; the uncompressed directory stores stay in temporary scratch.
+
+Each chromosome fingerprints its configuration, software, code, references, and
+input PGEN/PVAR/PSAM size/mtime. A matching completion receipt and verified final
+archives allow it to skip recomputation. Changed inputs replace that chromosome's
+final archives after successful computation, while diagnostics remain separated
+by fingerprint. Publication uses atomic replacement per ZIP; a receipt is committed
+after every ancestry has been published. Interrupted publication is retried on the
+next run. Previously published groups that are now skipped have their owned stale
+archives removed. A chromosome-level lock prevents competing publications.
+
+This layout represents one active analysis. Use a different `output_dir` when you
+want to retain separate final panels, estimators or parameter configurations.
+Large genotype files are identified by size/mtime rather than hashed; update their
+mtimes or `run_tag` when replacing contents. A killed job may leave a lock under
+`work_dir`; remove it only after confirming the corresponding job is no longer active.
+
+### Automatic reorganization and reuse
+
+Use the same entry point for old and new runs:
+
+```bash
+bash scripts/run_pipeline.sh
+```
+
+The launcher automatically moves legacy fingerprint folders out of `output_dir`
+and exposes their archives as `results/ANCESTRY/chr_N.zip`. Diagnostics move under
+`work_dir/legacy`. It uses same-filesystem renames with no decompression or full-file
+scans. Conflicting versions are rejected, and legacy folders with job locks are
+left alone until the jobs finish (remove stale locks only after confirming that
+those jobs are dead). `--check-only` does not move files.
+
+Preserved summaries and imported publication records let the launcher recognize
+completed chromosomes. It compares analysis settings, genotype size/mtime,
+reference hashes (using the panel's existing checksum receipt rather than scanning
+it on login), and archive identity/header metadata. ZIP CRC checks remain on compute
+nodes. Completed chromosomes are omitted from the submitted array. If all requested
+chromosomes are complete, no LD jobs are submitted. Changed settings or inputs still
+require recomputation. Missing/insufficient legacy provenance is handled conservatively.
+Output-layout code changes alone do not force recomputation; change `run_tag` for
+algorithm changes that require rebuilding otherwise matching outputs.
+
+To reorganize only, without preparing references or submitting any jobs:
+
+```bash
+bash scripts/run_pipeline.sh --organize-only
+```
+
+There is no need to invoke `migrate_outputs.py` separately. Final archives are ready
+for the existing Zenodo packaging command after reorganization.
+
+### Prepare Zenodo upload packages
+
+The script is adapted from
+[HGDP+1KG prepare_for_zenodo.sh](https://github.com/shz9/1KG_HGDP_ld/blob/main/scripts/prepare_for_zenodo.sh).
+It preserves that script's format: each ancestry ZIP is extracted into its
+chromosome Zarr directory, then combined into one `ANCESTRY.tar.gz`:
+
+```text
+EUR.tar.gz
+  EUR/chr_1/.zmetadata
+  EUR/chr_1/matrix/...
+  EUR/chr_2/...
+```
+
+Run packaging directly:
+
+```bash
+bash scripts/prepare_for_zenodo.sh results results_zenodo
+```
+
+Only `ANCESTRY/chr_*.zip` inputs are included; QC/metadata files are excluded.
+Each ZIP is integrity checked before extraction. Completed tarballs and SHA256
+sidecars are written to `results_zenodo/`. Temporary files use `TMPDIR` (default
+`/tmp`); provide enough space for one ancestry's unpacked Zarr stores at a time.
+For example, prefix the command with `TMPDIR=/path/to/scratch`. No SLURM allocation
+is required. It prepares local packages only and does not upload to Zenodo.
 
 ## Local verification
 
@@ -357,7 +436,7 @@ that test is skipped. Run the full set with `env/ld/bin/python -m unittest disco
 
 ```python
 import magenpy as mgp
-ld = mgp.LDMatrix.from_path("results/<fingerprint>/chr22/EUR/ld/chr_22.zip")
+ld = mgp.LDMatrix.from_path("results/EUR/chr_22.zip")
 print(ld.shape, ld.sample_size)
 # For a SMALL matrix only: float dtype dequantizes; symmetry restores the diagonal.
 r = ld.to_csr(dtype="float32", return_symmetric=True)

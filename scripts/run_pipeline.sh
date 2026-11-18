@@ -15,9 +15,11 @@ Usage: bash scripts/run_pipeline.sh [options]
   --rsids FILE [FILE...] Override config rsids (default: metadata/rsids.txt)
   --dbsnp-vcf FILE       Local GRCh38 VCF (default: data/reference/GCF_000001405.40.gz)
   --dbsnp-url URL        Download URL if the VCF is missing; fetches URL.md5 as well
+  --organize-only       Reorganize existing outputs and exit; no job submission
   --check-only          Validate existing inputs; no installation/download/submission
   --prepare-only        Prepare references (may submit a panel job); no LD jobs
   --help                Show this help
+Legacy output folders are reorganized automatically; completed chromosomes are reused.
 Downloads run on login; panel preparation runs in SLURM.
 If a panel job is needed, this command submits it and exits: wait, then rerun for LD.
 Set PYTHON_MODULE to override python/3.13 consistently for setup and jobs.
